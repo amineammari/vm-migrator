@@ -1,0 +1,19 @@
+# OS
+.DS_Store
+
+# Python backend
+backend/.env
+backend/.venv/
+backend/__pycache__/
+backend/**/*.pyc
+backend/logs/
+backend/db.sqlite3
+
+# Node frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.env
+
+# IDE
+.vscode/
+.idea/
