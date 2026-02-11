@@ -11,6 +11,7 @@ from openstack import exceptions as os_exceptions
 from openstack.config import OpenStackConfig
 from openstack.connection import Connection
 
+from .openstack_deployment import OpenStackDeploymentError, connect_openstack
 
 class OpenStackClientError(Exception):
     """Raised when OpenStack connectivity or API reads fail."""
@@ -66,27 +67,11 @@ class OpenStackClient:
 
     def _connect(self):
         try:
-            env_kwargs = _connect_kwargs_from_env()
-            if env_kwargs:
-                return openstack.connect(
-                    cloud=None,
-                    load_yaml_config=False,
-                    load_envvars=False,
-                    app_name="vm-migrator",
-                    app_version="1",
-                    **env_kwargs,
-                )
-
-            # When DevStack publishes the /image proxy endpoint (eg http://HOST/image) it can
-            # reject binary uploads (HTTP 415). Allow an env-based override for Glance.
-            image_endpoint_override = os.environ.get("OPENSTACK_IMAGE_ENDPOINT_OVERRIDE", "").strip() or None
-            if not image_endpoint_override:
-                return openstack.connect(cloud=self.cloud)
-
-            cfg = OpenStackConfig(load_yaml_config=True, load_envvars=True)
-            region = cfg.get_one_cloud(cloud=self.cloud)
-            region.config["image_endpoint_override"] = image_endpoint_override
-            return Connection(config=region)
+            # Reuse the exact same connection path as deployment tasks.
+            # This prevents drift between read-only API and migration runtime behavior.
+            return connect_openstack(cloud=self.cloud)
+        except OpenStackDeploymentError as exc:
+            raise OpenStackClientError(f"OpenStack authentication/configuration failed: {exc}") from exc
         except (os_exceptions.ConfigException, os_exceptions.SDKException, ks_exceptions.ClientException) as exc:
             raise OpenStackClientError(f"OpenStack authentication/configuration failed: {exc}") from exc
         except Exception as exc:
