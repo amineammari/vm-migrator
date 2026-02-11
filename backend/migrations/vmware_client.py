@@ -91,6 +91,7 @@ class WorkstationVMwareClient(VMwareClient):
                         "disks": disks,
                         "power_state": "unknown",
                         "vmx_path": str(vmx),
+                        "metadata": {"vmx_path": str(vmx)},
                     }
                 )
         return discovered
@@ -166,12 +167,30 @@ class ESXiVMwareClient(VMwareClient):
         if runtime and getattr(runtime, "powerState", None) is not None:
             power_state = str(runtime.powerState)
 
+        vmx_datastore_path = None
+        instance_uuid = None
+        has_snapshots = False
+        if config:
+            files = getattr(config, "files", None)
+            if files and getattr(files, "vmPathName", None):
+                vmx_datastore_path = str(files.vmPathName)
+            if getattr(config, "instanceUuid", None):
+                instance_uuid = str(config.instanceUuid)
+
+        if getattr(vm, "snapshot", None) is not None:
+            has_snapshots = True
+
         return {
             "name": vm.name,
             "cpu": cpu,
             "ram": ram,
             "disks": disks,
             "power_state": power_state,
+            "metadata": {
+                "vmx_datastore_path": vmx_datastore_path,
+                "instance_uuid": instance_uuid,
+                "has_snapshots": has_snapshots,
+            },
         }
 
     def discover_vms(self) -> list[dict[str, Any]]:

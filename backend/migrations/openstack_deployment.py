@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import os
 import re
 import time
 from dataclasses import dataclass
+from math import ceil
 from pathlib import Path
 from typing import Any, Callable
 
 import openstack
 from keystoneauth1 import exceptions as ks_exceptions
 from openstack import exceptions as os_exceptions
+from openstack.config import OpenStackConfig
+from openstack.connection import Connection
 
 
 class OpenStackDeploymentError(Exception):
@@ -43,9 +47,71 @@ def _retry_call(operation_name: str, attempts: int, delay_seconds: int, fn: Call
     raise OpenStackDeploymentError(f"{operation_name} failed after {attempts} attempts: {last_exc}") from last_exc
 
 
+def _bool_from_env(value: str | None) -> bool | None:
+    if value is None:
+        return None
+    v = value.strip().lower()
+    if v in {"1", "true", "yes", "y", "on"}:
+        return True
+    if v in {"0", "false", "no", "n", "off"}:
+        return False
+    return None
+
+
+def _connect_kwargs_from_env() -> dict[str, Any] | None:
+    """Build auth kwargs from OS_* env vars (preferred for DevStack setups)."""
+    auth_url = os.environ.get("OS_AUTH_URL", "").strip() or None
+    if not auth_url:
+        return None
+
+    kwargs: dict[str, Any] = {
+        "auth_url": auth_url,
+        "username": os.environ.get("OS_USERNAME", "").strip() or None,
+        "password": os.environ.get("OS_PASSWORD", "").strip() or None,
+        "project_name": os.environ.get("OS_PROJECT_NAME", "").strip() or None,
+        "user_domain_name": os.environ.get("OS_USER_DOMAIN_NAME", "").strip() or "Default",
+        "project_domain_name": os.environ.get("OS_PROJECT_DOMAIN_NAME", "").strip() or "Default",
+        "region_name": os.environ.get("OS_REGION_NAME", "").strip() or None,
+        "interface": os.environ.get("OS_INTERFACE", "").strip() or None,
+        "identity_api_version": os.environ.get("OS_IDENTITY_API_VERSION", "").strip() or None,
+    }
+
+    verify = _bool_from_env(os.environ.get("OS_VERIFY"))
+    if verify is not None:
+        kwargs["verify"] = verify
+
+    image_endpoint_override = os.environ.get("OPENSTACK_IMAGE_ENDPOINT_OVERRIDE", "").strip() or None
+    if image_endpoint_override:
+        kwargs["image_endpoint_override"] = image_endpoint_override
+
+    return kwargs
+
+
 def connect_openstack(cloud: str = "openstack"):
     try:
-        conn = openstack.connect(cloud=cloud)
+        env_kwargs = _connect_kwargs_from_env()
+        if env_kwargs:
+            conn = openstack.connect(
+                cloud=None,
+                load_yaml_config=False,
+                load_envvars=False,
+                app_name="vm-migrator",
+                app_version="1",
+                **env_kwargs,
+            )
+            conn.authorize()
+            return conn
+
+        image_endpoint_override = os.environ.get("OPENSTACK_IMAGE_ENDPOINT_OVERRIDE", "").strip() or None
+        if image_endpoint_override:
+            # DevStack often publishes a public Glance endpoint as http://HOST/image (apache proxy),
+            # which can reject PUT /v2/images/<id>/file with HTTP 415. Override to talk to Glance directly.
+            cfg = OpenStackConfig(load_yaml_config=True, load_envvars=True)
+            region = cfg.get_one_cloud(cloud=cloud)
+            region.config["image_endpoint_override"] = image_endpoint_override
+            conn = Connection(config=region)
+        else:
+            conn = openstack.connect(cloud=cloud)
         conn.authorize()
         return conn
     except (os_exceptions.ConfigException, os_exceptions.SDKException, ks_exceptions.ClientException) as exc:
@@ -133,16 +199,22 @@ def ensure_uploaded_image(
     if existing_by_name is not None:
         return existing_by_name.id
 
+    # NOTE: `conn.image.upload_image(...)` is deprecated in openstacksdk and does not
+    # accept a `filename=` argument (it expects `data=`). Using it will create a queued
+    # image with a 0-byte backing file. Use `create_image(filename=...)` instead.
     image = _retry_call(
         "image upload",
         retries,
         retry_delay_seconds,
-        lambda: conn.image.upload_image(
-            name=image_name,
+        lambda: conn.image.create_image(
+            image_name,
             filename=str(path),
             disk_format="qcow2",
             container_format="bare",
             visibility="private",
+            wait=False,
+            timeout=max(1, timeout_seconds),
+            validate_checksum=False,
         ),
     )
 
@@ -196,6 +268,83 @@ def ensure_server_booted(
     return server.id
 
 
+def ensure_volume_from_image(
+    conn,
+    *,
+    volume_name: str,
+    image_id: str,
+    existing_volume_id: str | None = None,
+    size_gb: int | None = None,
+    timeout_seconds: int = 900,
+    poll_interval_seconds: int = 5,
+    retries: int = 2,
+    retry_delay_seconds: int = 3,
+) -> str:
+    if existing_volume_id:
+        existing = conn.block_storage.find_volume(existing_volume_id, ignore_missing=True)
+        if existing is not None:
+            return existing.id
+
+    existing_by_name = conn.block_storage.find_volume(volume_name, ignore_missing=True)
+    if existing_by_name is not None:
+        return existing_by_name.id
+
+    if size_gb is None:
+        image = conn.image.get_image(image_id)
+        image_size = int(getattr(image, "size", 0) or 0)
+        size_gb = max(1, int(ceil(image_size / (1024 ** 3)))) if image_size > 0 else 1
+
+    volume = _retry_call(
+        "volume create",
+        retries,
+        retry_delay_seconds,
+        lambda: conn.block_storage.create_volume(
+            name=volume_name,
+            image_id=image_id,
+            size=size_gb,
+        ),
+    )
+
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        current = conn.block_storage.get_volume(volume.id)
+        status = str(getattr(current, "status", "")).lower()
+        if status == "available":
+            return current.id
+        if status in {"error", "error_extending"}:
+            raise OpenStackDeploymentError(
+                f"Volume '{volume_name}' entered terminal status '{status}'."
+            )
+        time.sleep(max(1, poll_interval_seconds))
+
+    raise OpenStackDeploymentError(f"Timed out waiting for volume '{volume_name}' to become available.")
+
+
+def attach_volume_to_server(
+    conn,
+    *,
+    server_id: str,
+    volume_id: str,
+    retries: int = 2,
+    retry_delay_seconds: int = 3,
+) -> str:
+    server = conn.compute.get_server(server_id)
+    existing_attachments = getattr(server, "attached_volumes", None) or []
+    if any(str(att.get("id")) == str(volume_id) for att in existing_attachments if isinstance(att, dict)):
+        return "already_attached"
+
+    _retry_call(
+        "volume attachment",
+        retries,
+        retry_delay_seconds,
+        lambda: conn.compute.create_volume_attachment(
+            server,
+            volumeId=volume_id,
+        ),
+    )
+    return "attached"
+
+
 def verify_server_active(
     conn,
     *,
@@ -233,6 +382,15 @@ def delete_image_if_exists(conn, image_id: str) -> str:
         return "not_found"
 
     conn.image.delete_image(image.id, ignore_missing=True)
+    return "deleted"
+
+
+def delete_volume_if_exists(conn, volume_id: str) -> str:
+    volume = conn.block_storage.find_volume(volume_id, ignore_missing=True)
+    if volume is None:
+        return "not_found"
+
+    conn.block_storage.delete_volume(volume.id, ignore_missing=True, force=True)
     return "deleted"
 
 

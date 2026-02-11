@@ -1,11 +1,17 @@
 import { useEffect, useMemo, useState } from 'react'
-import { fetchVMwareVMs, triggerMigrations } from '../api/vmware'
+import {
+  discoverVMwareNow,
+  fetchTaskStatus,
+  fetchVMwareVMs,
+  triggerMigrations,
+} from '../api/vmware'
 import PanelState from '../components/PanelState'
 
 function VMwareInventoryPage() {
   const [vms, setVMs] = useState([])
   const [selectedKeys, setSelectedKeys] = useState(new Set())
   const [loading, setLoading] = useState(true)
+  const [refreshing, setRefreshing] = useState(false)
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState('')
   const [result, setResult] = useState(null)
@@ -29,6 +35,39 @@ function VMwareInventoryPage() {
       setError(err.message || 'Unable to load VMware inventory.')
     } finally {
       setLoading(false)
+    }
+  }
+
+  async function refreshFromESXi() {
+    setRefreshing(true)
+    setError('')
+    try {
+      const discovery = await discoverVMwareNow({
+        include_workstation: false,
+        include_esxi: true,
+      })
+      const taskId = discovery?.task_id
+      if (!taskId) throw new Error('Discovery did not return a task id.')
+
+      const final = await waitForTaskCompletion(taskId)
+      if (final?.state !== 'SUCCESS') {
+        const reason =
+          typeof final?.result === 'string'
+            ? final.result
+            : final?.result?.error || `Discovery task failed with state ${final?.state}.`
+        throw new Error(reason)
+      }
+
+      const esxiErrors = final?.result?.esxi?.errors
+      if (Array.isArray(esxiErrors) && esxiErrors.length > 0) {
+        throw new Error(esxiErrors[0])
+      }
+
+      await loadVMs()
+    } catch (err) {
+      setError(err.message || 'Unable to refresh ESXi inventory.')
+    } finally {
+      setRefreshing(false)
     }
   }
 
@@ -67,8 +106,8 @@ function VMwareInventoryPage() {
           <h2>VMware Inventory</h2>
           <p>Select discovered VMs and start migration jobs.</p>
         </div>
-        <button className="secondary-btn" onClick={loadVMs} disabled={loading || submitting}>
-          Refresh
+        <button className="secondary-btn" onClick={refreshFromESXi} disabled={loading || refreshing || submitting}>
+          {refreshing ? 'Refreshing...' : 'Refresh'}
         </button>
       </div>
 
@@ -141,6 +180,21 @@ function VMwareInventoryPage() {
 
 function makeKey(vm) {
   return `${vm.source}::${vm.name}`
+}
+
+async function waitForTaskCompletion(taskId, timeoutMs = 60000, intervalMs = 1200) {
+  const startedAt = Date.now()
+  // Poll Celery task status until it reaches a terminal state.
+  while (Date.now() - startedAt < timeoutMs) {
+    const status = await fetchTaskStatus(taskId)
+    if (status?.ready) return status
+    await sleep(intervalMs)
+  }
+  throw new Error('Discovery timed out. Please try refresh again.')
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
 export default VMwareInventoryPage

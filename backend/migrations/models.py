@@ -77,6 +77,8 @@ class DiscoveredVM(models.Model):
     cpu = models.PositiveIntegerField(null=True, blank=True)
     ram = models.PositiveIntegerField(null=True, blank=True)
     disks = models.JSONField(default=list, blank=True)
+    # Extra provider-specific details (eg. ESXi instance UUID, datastore path).
+    metadata = models.JSONField(default=dict, blank=True)
     power_state = models.CharField(max_length=64, blank=True, default="")
     last_seen = models.DateTimeField(db_index=True)
 

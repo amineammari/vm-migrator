@@ -8,11 +8,14 @@ backend/__pycache__/
 backend/**/*.pyc
 backend/logs/
 backend/db.sqlite3
+backend/images/
 
 # Node frontend
 frontend/node_modules/
 frontend/dist/
 frontend/.env
+frontend/dev.out
+frontend/dev.pid
 
 # IDE
 .vscode/

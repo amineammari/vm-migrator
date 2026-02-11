@@ -7,6 +7,7 @@ import subprocess
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from celery import shared_task
 from django.conf import settings
@@ -17,12 +18,15 @@ from .conversion import ConversionPlanningError, ConversionPlan, plan_vmware_con
 from .models import DiscoveredVM, InvalidTransitionError, MigrationJob
 from .openstack_deployment import (
     OpenStackDeploymentError,
+    attach_volume_to_server,
     build_openstack_names,
     connect_openstack,
     delete_image_if_exists,
     delete_server_if_exists,
+    delete_volume_if_exists,
     ensure_server_booted,
     ensure_uploaded_image,
+    ensure_volume_from_image,
     map_vmware_to_flavor,
     select_default_network,
     verify_server_active,
@@ -139,26 +143,140 @@ def _validate_workstation_paths(input_disks: list[str], output_path: str) -> dic
     }
 
 
-def _find_output_qcow2(output_path: str, vm_name: str) -> Path:
-    expected = Path(output_path)
-    if expected.exists() and expected.is_file():
-        return expected
+def _ensure_libguestfs_kernel_readable() -> None:
+    """Fail fast if libguestfs/supermin cannot read the host kernel image.
 
+    On some hardened installs, `/boot/vmlinuz-*` is mode 0600 (root-only) which
+    causes supermin to fail and virt-v2v to exit early.
+    """
+    release = os.uname().release
+    kernel = Path("/boot") / f"vmlinuz-{release}"
+    if kernel.exists() and not os.access(kernel, os.R_OK):
+        raise ConversionPlanningError(
+            f"libguestfs cannot read host kernel image: {kernel}. "
+            "Fix permissions (example): "
+            f"sudo chmod 0644 {kernel}"
+        )
+
+
+def _build_esxi_libvirt_uri() -> str:
+    host = os.getenv("VMWARE_ESXI_HOST", "").strip()
+    username = os.getenv("VMWARE_ESXI_USERNAME", "").strip()
+    insecure = os.getenv("VMWARE_ESXI_INSECURE", "true").lower() in {"1", "true", "yes", "on"}
+    if not host or not username:
+        raise ConversionPlanningError("VMWARE_ESXI_HOST and VMWARE_ESXI_USERNAME are required for ESXi conversion.")
+
+    # Avoid leaking any special characters in the username; URI component should be encoded.
+    user_enc = quote(username, safe="")
+    uri = f"esx://{user_enc}@{host}"
+    if insecure:
+        uri += "?no_verify=1"
+    return uri
+
+
+def _write_password_file(tmp_dir: Path, password: str) -> Path:
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    passfile = tmp_dir / "esxi.password"
+    passfile.write_text(password, encoding="utf-8")
+    os.chmod(passfile, 0o600)
+    return passfile
+
+
+def _normalize_disk_artifact_path(p: Path) -> Path:
+    if p.suffix != "":
+        return p
+
+    renamed = p.with_name(p.name + ".qcow2")
+    if not renamed.exists():
+        try:
+            p.rename(renamed)
+            return renamed
+        except OSError:
+            return p
+    return renamed
+
+
+def _find_output_qcow2_paths(output_path: str, vm_name: str) -> list[Path]:
+    expected = Path(output_path)
     output_dir = expected.parent
     if not output_dir.exists():
         raise ConversionExecutionError(f"Output directory not found after conversion: {output_dir}")
 
-    candidates = sorted(output_dir.glob(f"{vm_name}*.qcow2"), key=lambda p: p.stat().st_mtime, reverse=True)
-    if candidates:
-        return candidates[0]
+    candidates: list[Path] = []
+
+    if expected.exists() and expected.is_file():
+        candidates.append(expected)
+
+    for pattern in [f"{vm_name}*.qcow2", f"{vm_name}-sd*", f"{vm_name}*"]:
+        for p in output_dir.glob(pattern):
+            if not p.is_file():
+                continue
+            if p.suffix.lower() == ".xml":
+                continue
+            candidates.append(p)
+
+    normalized = [_normalize_disk_artifact_path(p) for p in candidates]
+    unique = sorted({str(p): p for p in normalized}.values(), key=lambda x: x.name)
+    if unique:
+        return unique
 
     raise ConversionExecutionError(
         f"No QCOW2 output found in {output_dir} for VM '{vm_name}' after conversion."
     )
 
 
+def _select_primary_disk(paths: list[Path], vm_name: str) -> Path:
+    if not paths:
+        raise ConversionExecutionError(f"No conversion artifacts found for VM '{vm_name}'.")
+
+    for p in paths:
+        if p.name.endswith("-sda") or p.name.endswith("-sda.qcow2"):
+            return p
+    for p in paths:
+        if p.name == f"{vm_name}.qcow2":
+            return p
+    return paths[0]
+
+
 def _execute_virt_v2v(plan: ConversionPlan, vm_name: str) -> dict[str, Any]:
     start = time.monotonic()
+
+    run_env = os.environ.copy()
+    # If using VDDK transport, ensure nbdkit can locate the vddk plugin and VDDK libs.
+    transport = os.getenv("VMWARE_ESXI_CONVERSION_TRANSPORT", "").strip().lower()
+    if transport == "vddk":
+        # Ensure virt-v2v finds the intended nbdkit binary (it executes `nbdkit` via PATH).
+        # Prefer explicit binary, otherwise default to ~/.local/bin when present.
+        nbdkit_bin = os.getenv("VMWARE_NBDKIT_BIN", "").strip()
+        nbdkit_dir = None
+        if nbdkit_bin:
+            try:
+                nbdkit_dir = str(Path(nbdkit_bin).expanduser().resolve().parent)
+            except OSError:
+                nbdkit_dir = None
+        else:
+            candidate = Path.home() / ".local" / "bin" / "nbdkit"
+            if candidate.exists():
+                nbdkit_dir = str(candidate.parent)
+
+        if nbdkit_dir:
+            existing_path = run_env.get("PATH", "")
+            run_env["PATH"] = f"{nbdkit_dir}:{existing_path}" if existing_path else nbdkit_dir
+
+        plugin_path = os.getenv("VMWARE_VDDK_NBDKIT_PLUGIN_PATH", "").strip()
+        if plugin_path:
+            run_env["NBDKIT_PLUGIN_PATH"] = plugin_path
+
+        # virt-v2v uses nbdkit filters like "cow". Ensure nbdkit can find them.
+        filter_path = os.getenv("VMWARE_NBDKIT_FILTER_PATH", "").strip()
+        if filter_path:
+            run_env["NBDKIT_FILTER_PATH"] = filter_path
+
+        vddk_libdir = os.getenv("VMWARE_VDDK_LIBDIR", "").strip()
+        if vddk_libdir:
+            lib64 = str(Path(vddk_libdir).expanduser() / "lib64")
+            existing = run_env.get("LD_LIBRARY_PATH", "")
+            run_env["LD_LIBRARY_PATH"] = f"{lib64}:{existing}" if existing else lib64
 
     try:
         completed = subprocess.run(
@@ -167,6 +285,7 @@ def _execute_virt_v2v(plan: ConversionPlan, vm_name: str) -> dict[str, Any]:
             text=True,
             check=False,
             timeout=int(getattr(settings, "VIRT_V2V_TIMEOUT_SECONDS", 7200)),
+            env=run_env,
         )
     except PermissionError as exc:
         raise ConversionExecutionError(f"Permission error executing virt-v2v: {exc}") from exc
@@ -193,16 +312,30 @@ def _execute_virt_v2v(plan: ConversionPlan, vm_name: str) -> dict[str, Any]:
             stderr=stderr,
         )
 
-    qcow2_path = _find_output_qcow2(plan.output_path, vm_name)
-    disk_size = qcow2_path.stat().st_size
+    try:
+        qcow2_paths = _find_output_qcow2_paths(plan.output_path, vm_name)
+        primary_qcow2_path = _select_primary_disk(qcow2_paths, vm_name)
+    except ConversionExecutionError as exc:
+        # Preserve virt-v2v logs even when artifact detection fails.
+        raise ConversionExecutionError(str(exc), stdout=stdout, stderr=stderr) from exc
+
+    disk_sizes: dict[str, int] = {}
+    for p in qcow2_paths:
+        try:
+            disk_sizes[str(p)] = int(p.stat().st_size)
+        except OSError:
+            disk_sizes[str(p)] = 0
 
     return {
         "returncode": completed.returncode,
         "duration_seconds": duration,
         "stdout": _truncate_log(stdout),
         "stderr": _truncate_log(stderr),
-        "output_qcow2_path": str(qcow2_path),
-        "disk_size": disk_size,
+        "output_qcow2_path": str(primary_qcow2_path),
+        "output_qcow2_paths": [str(p) for p in qcow2_paths],
+        "disk_size": disk_sizes.get(str(primary_qcow2_path), 0),
+        "disk_sizes": disk_sizes,
+        "disk_count": len(qcow2_paths),
     }
 
 
@@ -243,13 +376,34 @@ def _collect_cleanup_targets(job: MigrationJob, context: dict[str, Any] | None) 
     file_candidates: list[str] = []
     dir_candidates: list[str] = []
 
+    # Never delete backup artifacts during rollback.
+    exclude_files = set()
+    if isinstance(conversion.get("backup"), dict):
+        backup_path = conversion["backup"].get("path")
+        if isinstance(backup_path, str) and backup_path.strip():
+            exclude_files.add(str(Path(backup_path).expanduser()))
+        backup_paths = conversion["backup"].get("paths")
+        if isinstance(backup_paths, list):
+            for backup_item in backup_paths:
+                if isinstance(backup_item, str) and backup_item.strip():
+                    exclude_files.add(str(Path(backup_item).expanduser()))
+
     for candidate in [
         execution.get("output_qcow2_path"),
         conversion.get("output_path"),
         context.get("output_qcow2_path"),
     ]:
         if isinstance(candidate, str) and candidate.strip():
-            file_candidates.append(candidate.strip())
+            p = str(Path(candidate.strip()).expanduser())
+            if p not in exclude_files:
+                file_candidates.append(candidate.strip())
+
+    if isinstance(execution.get("output_qcow2_paths"), list):
+        for candidate in execution.get("output_qcow2_paths", []):
+            if isinstance(candidate, str) and candidate.strip():
+                p = str(Path(candidate.strip()).expanduser())
+                if p not in exclude_files:
+                    file_candidates.append(candidate.strip())
 
     for candidate in context.get("temp_dirs", []):
         if isinstance(candidate, str) and candidate.strip():
@@ -283,9 +437,21 @@ def _rollback_openstack_resources(job: MigrationJob, actions: list[dict[str, Any
     metadata = job.conversion_metadata if isinstance(job.conversion_metadata, dict) else {}
     os_meta = metadata.get("openstack", {}) if isinstance(metadata.get("openstack"), dict) else {}
 
-    image_id = os_meta.get("image_id")
     server_id = os_meta.get("server_id")
-    if not image_id and not server_id:
+    image_ids: list[str] = []
+    if isinstance(os_meta.get("image_ids"), list):
+        image_ids.extend([str(v) for v in os_meta.get("image_ids") if isinstance(v, str) and v.strip()])
+    legacy_image_id = os_meta.get("image_id")
+    if isinstance(legacy_image_id, str) and legacy_image_id.strip():
+        image_ids.append(legacy_image_id.strip())
+    image_ids = list(dict.fromkeys(image_ids))
+
+    volume_ids: list[str] = []
+    if isinstance(os_meta.get("volume_ids"), list):
+        volume_ids.extend([str(v) for v in os_meta.get("volume_ids") if isinstance(v, str) and v.strip()])
+    volume_ids = list(dict.fromkeys(volume_ids))
+
+    if not image_ids and not server_id and not volume_ids:
         return
 
     cloud = getattr(settings, "OPENSTACK_CLOUD_NAME", "openstack")
@@ -307,7 +473,19 @@ def _rollback_openstack_resources(job: MigrationJob, actions: list[dict[str, Any
                 "error": str(exc),
             })
 
-    if image_id:
+    for volume_id in volume_ids:
+        try:
+            status = delete_volume_if_exists(conn, volume_id)
+            actions.append({"action": "delete_volume", "volume_id": volume_id, "status": status})
+        except Exception as exc:
+            actions.append({
+                "action": "delete_volume",
+                "volume_id": volume_id,
+                "status": "error",
+                "error": str(exc),
+            })
+
+    for image_id in image_ids:
         try:
             status = delete_image_if_exists(conn, image_id)
             actions.append({"action": "delete_image", "image_id": image_id, "status": status})
@@ -418,8 +596,17 @@ def _run_openstack_deployment(job: MigrationJob, discovered_vm: DiscoveredVM) ->
     conversion = metadata.get("conversion", {}) if isinstance(metadata.get("conversion"), dict) else {}
     execution = conversion.get("execution", {}) if isinstance(conversion.get("execution"), dict) else {}
 
-    qcow2_path = execution.get("output_qcow2_path") or conversion.get("output_path")
-    if not isinstance(qcow2_path, str) or not qcow2_path.strip():
+    qcow2_paths_raw = execution.get("output_qcow2_paths")
+    qcow2_paths: list[str] = []
+    if isinstance(qcow2_paths_raw, list):
+        qcow2_paths = [str(p).strip() for p in qcow2_paths_raw if isinstance(p, str) and str(p).strip()]
+
+    if not qcow2_paths:
+        legacy_path = execution.get("output_qcow2_path") or conversion.get("output_path")
+        if isinstance(legacy_path, str) and legacy_path.strip():
+            qcow2_paths = [legacy_path.strip()]
+
+    if not qcow2_paths:
         raise OpenStackDeploymentError("Missing QCOW2 path in conversion metadata for OpenStack upload.")
 
     cloud = getattr(settings, "OPENSTACK_CLOUD_NAME", "openstack")
@@ -432,21 +619,34 @@ def _run_openstack_deployment(job: MigrationJob, discovered_vm: DiscoveredVM) ->
     preferred_network = getattr(settings, "OPENSTACK_DEFAULT_NETWORK", "") or None
     network = select_default_network(conn, preferred_name=preferred_network)
 
-    image_id = ensure_uploaded_image(
-        conn,
-        qcow2_path=qcow2_path,
-        image_name=names["image_name"],
-        existing_image_id=os_meta.get("image_id"),
-        timeout_seconds=int(getattr(settings, "OPENSTACK_IMAGE_UPLOAD_TIMEOUT", 900)),
-        poll_interval_seconds=int(getattr(settings, "OPENSTACK_IMAGE_UPLOAD_POLL_INTERVAL", 5)),
-        retries=int(getattr(settings, "OPENSTACK_API_RETRIES", 2)),
-        retry_delay_seconds=int(getattr(settings, "OPENSTACK_API_RETRY_DELAY", 3)),
-    )
+    existing_image_ids = os_meta.get("image_ids") if isinstance(os_meta.get("image_ids"), list) else []
+    image_ids: list[str] = []
+    for idx, qcow2_path in enumerate(qcow2_paths):
+        image_name = names["image_name"] if idx == 0 else f"{names['image_name']}-disk{idx}"
+        existing_image_id = None
+        if idx < len(existing_image_ids) and isinstance(existing_image_ids[idx], str):
+            existing_image_id = existing_image_ids[idx]
+        elif idx == 0 and isinstance(os_meta.get("image_id"), str):
+            existing_image_id = os_meta.get("image_id")
+
+        image_id = ensure_uploaded_image(
+            conn,
+            qcow2_path=qcow2_path,
+            image_name=image_name,
+            existing_image_id=existing_image_id,
+            timeout_seconds=int(getattr(settings, "OPENSTACK_IMAGE_UPLOAD_TIMEOUT", 900)),
+            poll_interval_seconds=int(getattr(settings, "OPENSTACK_IMAGE_UPLOAD_POLL_INTERVAL", 5)),
+            retries=int(getattr(settings, "OPENSTACK_API_RETRIES", 2)),
+            retry_delay_seconds=int(getattr(settings, "OPENSTACK_API_RETRY_DELAY", 3)),
+        )
+        image_ids.append(image_id)
+
+    primary_image_id = image_ids[0]
 
     server_id = ensure_server_booted(
         conn,
         server_name=names["server_name"],
-        image_id=image_id,
+        image_id=primary_image_id,
         flavor_id=flavor.id,
         network_id=network.id,
         existing_server_id=os_meta.get("server_id"),
@@ -454,17 +654,57 @@ def _run_openstack_deployment(job: MigrationJob, discovered_vm: DiscoveredVM) ->
         retry_delay_seconds=int(getattr(settings, "OPENSTACK_API_RETRY_DELAY", 3)),
     )
 
+    existing_volume_ids = os_meta.get("volume_ids") if isinstance(os_meta.get("volume_ids"), list) else []
+    attached_volumes: list[dict[str, Any]] = []
+    volume_ids: list[str] = []
+    for idx, image_id in enumerate(image_ids[1:], start=1):
+        vol_name = f"{names['server_name']}-disk{idx}"
+        existing_volume_id = None
+        if (idx - 1) < len(existing_volume_ids) and isinstance(existing_volume_ids[idx - 1], str):
+            existing_volume_id = existing_volume_ids[idx - 1]
+        volume_id = ensure_volume_from_image(
+            conn,
+            volume_name=vol_name,
+            image_id=image_id,
+            existing_volume_id=existing_volume_id,
+            timeout_seconds=int(getattr(settings, "OPENSTACK_VERIFY_TIMEOUT", 900)),
+            poll_interval_seconds=int(getattr(settings, "OPENSTACK_IMAGE_UPLOAD_POLL_INTERVAL", 5)),
+            retries=int(getattr(settings, "OPENSTACK_API_RETRIES", 2)),
+            retry_delay_seconds=int(getattr(settings, "OPENSTACK_API_RETRY_DELAY", 3)),
+        )
+        volume_ids.append(volume_id)
+        attach_status = attach_volume_to_server(
+            conn,
+            server_id=server_id,
+            volume_id=volume_id,
+            retries=int(getattr(settings, "OPENSTACK_API_RETRIES", 2)),
+            retry_delay_seconds=int(getattr(settings, "OPENSTACK_API_RETRY_DELAY", 3)),
+        )
+        attached_volumes.append(
+            {
+                "index": idx,
+                "image_id": image_id,
+                "volume_id": volume_id,
+                "status": attach_status,
+            }
+        )
+
     os_meta.update(
         {
             "cloud": cloud,
-            "image_id": image_id,
+            "image_id": primary_image_id,
+            "image_ids": image_ids,
             "image_name": names["image_name"],
+            "image_names": [names["image_name"]] + [f"{names['image_name']}-disk{i}" for i in range(1, len(image_ids))],
+            "source_qcow2_paths": qcow2_paths,
             "flavor_id": flavor.id,
             "flavor_name": flavor.name,
             "network_id": network.id,
             "network_name": network.name,
             "server_id": server_id,
             "server_name": names["server_name"],
+            "volume_ids": volume_ids,
+            "attached_volumes": attached_volumes,
         }
     )
 
@@ -494,8 +734,10 @@ def _run_openstack_deployment(job: MigrationJob, discovered_vm: DiscoveredVM) ->
         "job_id": job.id,
         "result": "deployed",
         "status": job.status,
-        "image_id": image_id,
+        "image_id": primary_image_id,
+        "image_ids": image_ids,
         "server_id": server_id,
+        "volume_ids": volume_ids,
         "flavor": {"id": flavor.id, "name": flavor.name},
         "network": {"id": network.id, "name": network.name},
     }
@@ -506,12 +748,12 @@ def start_migration(job_id: int) -> dict[str, Any]:
     """Migration starter with conversion and optional OpenStack deployment."""
 
     try:
-        job = MigrationJob.objects.get(id=job_id)
-    except MigrationJob.DoesNotExist:
-        logger.error("migration.start missing job", extra={"job_id": job_id})
-        return {"job_id": job_id, "result": "missing"}
+        try:
+            job = MigrationJob.objects.get(id=job_id)
+        except MigrationJob.DoesNotExist:
+            logger.error("migration.start missing job", extra={"job_id": job_id})
+            return {"job_id": job_id, "result": "missing"}
 
-    try:
         logger.info(
             "migration.start begin",
             extra={"job_id": job.id, "vm_name": job.vm_name, "status": job.status},
@@ -519,110 +761,226 @@ def start_migration(job_id: int) -> dict[str, Any]:
 
         discovered_vm: DiscoveredVM | None = None
 
+        # Keep DB transactions short: only lock+transition the job state here.
         with transaction.atomic():
+            job = MigrationJob.objects.select_for_update().get(id=job_id)
             if job.status == MigrationJob.Status.PENDING:
                 job.transition(MigrationJob.Status.DISCOVERED)
-
             if job.status == MigrationJob.Status.DISCOVERED:
                 job.transition(MigrationJob.Status.CONVERTING)
 
-            if job.status == MigrationJob.Status.CONVERTING:
-                discovered_vm = _find_discovered_vm_for_job(job)
-                plan = plan_vmware_conversion(discovered_vm, output_dir=settings.MIGRATION_OUTPUT_DIR)
+        job.refresh_from_db()
 
-                validation = {
-                    "checked_paths": [],
-                    "errors": [],
-                    "skipped": False,
-                }
-                if discovered_vm.source == DiscoveredVM.Source.WORKSTATION:
-                    validation = _validate_workstation_paths(plan.input_disks, plan.output_path)
-                    if validation["errors"]:
-                        raise ConversionPlanningError("; ".join(validation["errors"]))
-                else:
-                    validation["skipped"] = True
-                    validation["reason"] = "esxi execution not implemented"
+        # Conversion stage (may take minutes): no DB transaction should be held open here.
+        if job.status == MigrationJob.Status.CONVERTING:
+            discovered_vm = _find_discovered_vm_for_job(job)
+            esxi_uri = None
+            passfile: Path | None = None
 
-                if discovered_vm.source == DiscoveredVM.Source.ESXI and settings.ENABLE_REAL_CONVERSION:
-                    raise ConversionPlanningError("Real ESXi conversion execution is not implemented yet.")
-
-                real_conversion_enabled = bool(getattr(settings, "ENABLE_REAL_CONVERSION", False))
-                mode = "real" if real_conversion_enabled else "dry-run"
-
-                metadata = job.conversion_metadata if isinstance(job.conversion_metadata, dict) else {}
-                previous_execution = {}
-                if isinstance(metadata.get("conversion"), dict) and isinstance(metadata["conversion"].get("execution"), dict):
-                    previous_execution = metadata["conversion"]["execution"]
-
-                metadata.update(
-                    _build_base_conversion_metadata(
-                        discovered_vm=discovered_vm,
-                        plan=plan,
-                        validation=validation,
-                        mode=mode,
+            if discovered_vm.source == DiscoveredVM.Source.ESXI:
+                # For safety: require powered off in ESXi conversions.
+                if (discovered_vm.power_state or "").lower() not in {"poweredoff", "powered_off", "poweroff", "off"}:
+                    raise ConversionPlanningError(
+                        f"ESXi VM '{discovered_vm.name}' must be powered off for safe conversion "
+                        f"(current power_state='{discovered_vm.power_state}')."
                     )
-                )
-                if previous_execution:
-                    metadata["conversion"]["execution"] = previous_execution
 
-                prior = metadata.get("conversion", {}).get("execution", {})
-                if prior.get("state") == "succeeded" and prior.get("output_qcow2_path"):
-                    out = Path(prior["output_qcow2_path"])
-                    if out.exists() and out.is_file():
-                        if job.can_transition_to(MigrationJob.Status.UPLOADING):
+                # Minimal snapshot guardrail: refuse to proceed if VM has snapshots (default).
+                require_no_snaps = bool(getattr(settings, "VMWARE_REQUIRE_NO_SNAPSHOTS", True))
+                has_snaps = bool((discovered_vm.metadata or {}).get("has_snapshots"))
+                if require_no_snaps and has_snaps:
+                    raise ConversionPlanningError(
+                        f"ESXi VM '{discovered_vm.name}' has snapshots; consolidate/remove snapshots before conversion."
+                    )
+
+                esxi_password = os.getenv("VMWARE_ESXI_PASSWORD", "").strip()
+                if not esxi_password:
+                    raise ConversionPlanningError("VMWARE_ESXI_PASSWORD is required for ESXi conversion.")
+
+                # Create a per-job temp dir for secret files; rollback cleans it.
+                temp_dir = Path(settings.MIGRATION_OUTPUT_DIR) / "tmp" / f"job-{job.id}"
+                passfile = _write_password_file(temp_dir, esxi_password)
+                esxi_uri = _build_esxi_libvirt_uri()
+
+            plan = plan_vmware_conversion(
+                discovered_vm,
+                output_dir=settings.MIGRATION_OUTPUT_DIR,
+                esxi_uri=esxi_uri,
+                password_file=str(passfile) if passfile else None,
+                esxi_transport=os.getenv("VMWARE_ESXI_CONVERSION_TRANSPORT", "").strip().lower() or None,
+                vddk_libdir=os.getenv("VMWARE_VDDK_LIBDIR", "").strip() or None,
+                vddk_thumbprint=os.getenv("VMWARE_VDDK_THUMBPRINT", "").strip() or None,
+            )
+
+            validation: dict[str, Any] = {"checked_paths": [], "errors": [], "skipped": False}
+            if discovered_vm.source == DiscoveredVM.Source.WORKSTATION:
+                validation = _validate_workstation_paths(plan.input_disks, plan.output_path)
+                if validation["errors"]:
+                    raise ConversionPlanningError("; ".join(validation["errors"]))
+            elif discovered_vm.source == DiscoveredVM.Source.ESXI:
+                validation["checked_paths"] = [
+                    {"password_file": str(passfile) if passfile else None, "esxi_uri": esxi_uri}
+                ]
+            else:
+                raise ConversionPlanningError(f"Unsupported VMware source '{discovered_vm.source}'.")
+
+            real_conversion_enabled = bool(getattr(settings, "ENABLE_REAL_CONVERSION", False))
+            mode = "real" if real_conversion_enabled else "dry-run"
+            if real_conversion_enabled:
+                _ensure_libguestfs_kernel_readable()
+
+            metadata = job.conversion_metadata if isinstance(job.conversion_metadata, dict) else {}
+            previous_execution: dict[str, Any] = {}
+            if isinstance(metadata.get("conversion"), dict) and isinstance(metadata["conversion"].get("execution"), dict):
+                previous_execution = metadata["conversion"]["execution"]
+
+            metadata.update(
+                _build_base_conversion_metadata(
+                    discovered_vm=discovered_vm,
+                    plan=plan,
+                    validation=validation,
+                    mode=mode,
+                )
+            )
+
+            # Track temp dirs so rollback can clean them.
+            if discovered_vm.source == DiscoveredVM.Source.ESXI:
+                temp_dirs = metadata.get("conversion", {}).get("temp_dirs")
+                if not isinstance(temp_dirs, list):
+                    temp_dirs = []
+                temp_dir_str = str((Path(settings.MIGRATION_OUTPUT_DIR) / "tmp" / f"job-{job.id}"))
+                if temp_dir_str not in temp_dirs:
+                    temp_dirs.append(temp_dir_str)
+                metadata["conversion"]["temp_dirs"] = temp_dirs
+
+            # Preserve earlier execution metadata if present.
+            if previous_execution:
+                metadata["conversion"]["execution"] = previous_execution
+
+            prior = metadata.get("conversion", {}).get("execution", {})
+            if prior.get("state") == "succeeded" and prior.get("output_qcow2_path"):
+                out = Path(prior["output_qcow2_path"])
+                if out.exists() and out.is_file():
+                    with transaction.atomic():
+                        job = MigrationJob.objects.select_for_update().get(id=job_id)
+                        if job.status == MigrationJob.Status.CONVERTING and job.can_transition_to(MigrationJob.Status.UPLOADING):
                             job.transition(MigrationJob.Status.UPLOADING)
                         job.conversion_metadata = metadata
                         job.save(update_fields=["status", "conversion_metadata", "updated_at"])
-                    else:
-                        previous_execution = {}
+                else:
+                    previous_execution = {}
 
-                if job.status == MigrationJob.Status.CONVERTING:
-                    if not real_conversion_enabled:
-                        job.conversion_metadata = metadata
-                        job.save(update_fields=["conversion_metadata", "updated_at"])
-                        logger.info(
-                            "migration.start planned_dry_run",
-                            extra={
-                                "job_id": job.id,
-                                "vm_name": job.vm_name,
-                                "source": discovered_vm.source,
-                                "command": plan.command,
-                            },
-                        )
-                        return {
-                            "job_id": job.id,
-                            "result": "planned",
-                            "status": job.status,
-                            "vm_name": job.vm_name,
-                            "source": discovered_vm.source,
-                            "command": plan.command,
-                            "input_disks": plan.input_disks,
-                            "output_path": plan.output_path,
-                            "dry_run": True,
-                        }
+            if not real_conversion_enabled:
+                job.conversion_metadata = metadata
+                job.save(update_fields=["conversion_metadata", "updated_at"])
+                logger.info(
+                    "migration.start planned_dry_run",
+                    extra={
+                        "job_id": job.id,
+                        "vm_name": job.vm_name,
+                        "source": discovered_vm.source,
+                        "command": plan.command,
+                    },
+                )
+                return {
+                    "job_id": job.id,
+                    "result": "planned",
+                    "status": job.status,
+                    "vm_name": job.vm_name,
+                    "source": discovered_vm.source,
+                    "command": plan.command,
+                    "input_disks": plan.input_disks,
+                    "output_path": plan.output_path,
+                    "dry_run": True,
+                }
 
-                    exec_result = _execute_virt_v2v(plan, discovered_vm.name)
-                    metadata["conversion"]["execution"] = {
-                        "state": "succeeded",
-                        **exec_result,
+            # Concurrency guard: only one worker should run conversion for a given job at a time.
+            # We do a short "compare-and-set" under a row lock, then release it before running virt-v2v.
+            with transaction.atomic():
+                job = MigrationJob.objects.select_for_update().get(id=job_id)
+                db_meta = job.conversion_metadata if isinstance(job.conversion_metadata, dict) else {}
+                db_conv = db_meta.get("conversion", {}) if isinstance(db_meta.get("conversion"), dict) else {}
+                db_exec = db_conv.get("execution", {}) if isinstance(db_conv.get("execution"), dict) else {}
+                if db_exec.get("state") == "running":
+                    logger.info(
+                        "migration.start conversion_already_running",
+                        extra={"job_id": job.id, "vm_name": job.vm_name},
+                    )
+                    return {
+                        "job_id": job.id,
+                        "result": "already_running",
+                        "status": job.status,
                     }
 
-                    job.conversion_metadata = metadata
-                    if job.can_transition_to(MigrationJob.Status.UPLOADING):
-                        job.transition(MigrationJob.Status.UPLOADING)
-                    job.save(update_fields=["status", "conversion_metadata", "updated_at"])
+                metadata["conversion"]["execution"] = {
+                    "state": "running",
+                    "started_at": timezone.now().isoformat(),
+                }
+                job.conversion_metadata = metadata
+                job.save(update_fields=["conversion_metadata", "updated_at"])
 
-                    logger.info(
-                        "migration.start conversion_success",
-                        extra={
-                            "job_id": job.id,
-                            "vm_name": job.vm_name,
-                            "command": plan.command,
-                            "output_qcow2_path": exec_result["output_qcow2_path"],
-                        },
-                    )
+            exec_result = _execute_virt_v2v(plan, discovered_vm.name)
+            metadata["conversion"]["execution"] = {
+                "state": "succeeded",
+                **exec_result,
+            }
 
-        job.refresh_from_db()
+            # Optional minimal artifact backup: keep a copy of the QCOW2 before OpenStack upload.
+            if bool(getattr(settings, "ENABLE_ARTIFACT_BACKUP", False)):
+                try:
+                    src_paths = exec_result.get("output_qcow2_paths")
+                    if not isinstance(src_paths, list) or not src_paths:
+                        src_paths = [exec_result["output_qcow2_path"]]
+                    backup_root = Path(
+                        getattr(
+                            settings,
+                            "ARTIFACT_BACKUP_DIR",
+                            str(Path(settings.MIGRATION_OUTPUT_DIR) / "backups"),
+                        )
+                    ).expanduser()
+                    backup_dir = backup_root / f"job-{job.id}"
+                    backup_dir.mkdir(parents=True, exist_ok=True)
+                    backup_paths: list[str] = []
+                    for src_raw in src_paths:
+                        src = Path(str(src_raw)).expanduser().resolve()
+                        dst = backup_dir / src.name
+                        if not dst.exists():
+                            shutil.copy2(src, dst)
+                        backup_paths.append(str(dst))
+                    metadata["conversion"]["backup"] = {
+                        "enabled": True,
+                        "path": backup_paths[0] if backup_paths else "",
+                        "paths": backup_paths,
+                        "method": "copy2",
+                        "created_at": timezone.now().isoformat(),
+                    }
+                except Exception as exc:
+                    if bool(getattr(settings, "ARTIFACT_BACKUP_REQUIRED", False)):
+                        raise
+                    warnings = metadata["conversion"].get("warnings")
+                    if not isinstance(warnings, list):
+                        warnings = []
+                    warnings.append(f"artifact backup failed: {exc}")
+                    metadata["conversion"]["warnings"] = warnings
+
+            with transaction.atomic():
+                job = MigrationJob.objects.select_for_update().get(id=job_id)
+                job.conversion_metadata = metadata
+                if job.status == MigrationJob.Status.CONVERTING and job.can_transition_to(MigrationJob.Status.UPLOADING):
+                    job.transition(MigrationJob.Status.UPLOADING)
+                job.save(update_fields=["status", "conversion_metadata", "updated_at"])
+
+            logger.info(
+                "migration.start conversion_success",
+                extra={
+                    "job_id": job.id,
+                    "vm_name": job.vm_name,
+                    "command": plan.command,
+                    "output_qcow2_path": exec_result["output_qcow2_path"],
+                },
+            )
+
+            job.refresh_from_db()
 
         if job.status == MigrationJob.Status.UPLOADING and not discovered_vm:
             discovered_vm = _find_discovered_vm_for_job(job)
@@ -732,6 +1090,7 @@ def discover_vmware_vms(include_workstation: bool = True, include_esxi: bool = T
                 "cpu": item.get("cpu"),
                 "ram": item.get("ram"),
                 "disks": item.get("disks", []),
+                "metadata": item.get("metadata", {}) if isinstance(item.get("metadata"), dict) else {},
                 "power_state": item.get("power_state") or "",
                 "last_seen": now,
             }

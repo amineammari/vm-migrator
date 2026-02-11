@@ -1,4 +1,5 @@
 from django.db import transaction
+from celery.result import AsyncResult
 from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.exceptions import APIException
@@ -8,7 +9,7 @@ from rest_framework.response import Response
 from .models import DiscoveredVM, MigrationJob
 from .openstack_client import OpenStackClient, OpenStackClientError
 from .serializers import CreateMigrationFromVMwareSerializer, MigrationJobSummarySerializer
-from .tasks import start_migration
+from .tasks import discover_vmware_vms, rollback_migration, start_migration
 
 
 @api_view(["GET"])
@@ -86,12 +87,35 @@ def vmware_vms(request):
             "cpu": vm.cpu,
             "ram": vm.ram,
             "disks": vm.disks,
+            "metadata": vm.metadata,
             "power_state": vm.power_state,
             "last_seen": vm.last_seen.isoformat(),
         }
         for vm in qs
     ]
     return Response({"items": items}, status=status.HTTP_200_OK)
+
+
+@api_view(["GET"])
+@permission_classes([AllowAny])
+def list_migrations(request):
+    """List migration jobs for dashboard polling."""
+    jobs = MigrationJob.objects.order_by("-created_at")
+    return Response(MigrationJobSummarySerializer(jobs, many=True).data, status=status.HTTP_200_OK)
+
+
+@api_view(["GET"])
+@permission_classes([AllowAny])
+def migration_detail(request, job_id: int):
+    """Return one migration job including conversion metadata."""
+    try:
+        job = MigrationJob.objects.get(id=job_id)
+    except MigrationJob.DoesNotExist:
+        return Response({"error": f"Migration job {job_id} not found."}, status=status.HTTP_404_NOT_FOUND)
+
+    payload = MigrationJobSummarySerializer(job).data
+    payload["conversion_metadata"] = job.conversion_metadata
+    return Response(payload, status=status.HTTP_200_OK)
 
 
 @api_view(["POST"])
@@ -167,3 +191,66 @@ def create_migrations_from_vmware(request):
         },
         status=status.HTTP_201_CREATED,
     )
+
+
+@api_view(["POST"])
+@permission_classes([AllowAny])
+def discover_now(request):
+    """
+    Enqueue a discovery run immediately (async) and return the Celery task id.
+
+    Optional JSON body:
+      - include_workstation: bool (default true)
+      - include_esxi: bool (default true)
+    """
+    body = request.data if isinstance(request.data, dict) else {}
+    include_workstation = bool(body.get("include_workstation", True))
+    include_esxi = bool(body.get("include_esxi", True))
+
+    async_result = discover_vmware_vms.delay(
+        include_workstation=include_workstation,
+        include_esxi=include_esxi,
+    )
+    return Response(
+        {
+            "task_id": async_result.id,
+            "queued": True,
+            "include_workstation": include_workstation,
+            "include_esxi": include_esxi,
+        },
+        status=status.HTTP_202_ACCEPTED,
+    )
+
+
+@api_view(["POST"])
+@permission_classes([AllowAny])
+def start_migration_now(request, job_id: int):
+    """Enqueue start_migration(job_id) (async) and return the Celery task id."""
+    async_result = start_migration.delay(job_id)
+    return Response({"task_id": async_result.id, "queued": True, "job_id": job_id}, status=status.HTTP_202_ACCEPTED)
+
+
+@api_view(["POST"])
+@permission_classes([AllowAny])
+def rollback_migration_now(request, job_id: int):
+    """Enqueue rollback_migration(job_id) (async) and return the Celery task id."""
+    context = request.data if isinstance(request.data, dict) else {}
+    async_result = rollback_migration.delay(job_id, context=context)
+    return Response({"task_id": async_result.id, "queued": True, "job_id": job_id}, status=status.HTTP_202_ACCEPTED)
+
+
+@api_view(["GET"])
+@permission_classes([AllowAny])
+def task_status(request, task_id: str):
+    """Return Celery task state and (when available) its result."""
+    res = AsyncResult(task_id)
+    payload = {
+        "task_id": task_id,
+        "state": res.state,
+        "ready": res.ready(),
+        "successful": res.successful() if res.ready() else None,
+    }
+    if res.ready():
+        # Result is expected to be JSON-serializable (dict/str/etc.)
+        payload["result"] = res.result
+    return Response(payload, status=status.HTTP_200_OK)

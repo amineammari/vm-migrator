@@ -1,3 +1,4 @@
+from datetime import timedelta
 from pathlib import Path
 
 import dj_database_url
@@ -121,6 +122,21 @@ CELERY_TASK_PUBLISH_RETRY_POLICY = {
     "interval_max": 3,
 }
 
+# Periodic discovery (Celery beat)
+ENABLE_PERIODIC_DISCOVERY = env.bool("ENABLE_PERIODIC_DISCOVERY", default=False)
+DISCOVERY_INTERVAL_SECONDS = env.int("DISCOVERY_INTERVAL_SECONDS", default=300)
+DISCOVERY_INCLUDE_WORKSTATION = env.bool("DISCOVERY_INCLUDE_WORKSTATION", default=True)
+DISCOVERY_INCLUDE_ESXI = env.bool("DISCOVERY_INCLUDE_ESXI", default=True)
+
+if ENABLE_PERIODIC_DISCOVERY:
+    CELERY_BEAT_SCHEDULE = {
+        "discover-vmware-vms": {
+            "task": "migrations.discover_vmware_vms",
+            "schedule": timedelta(seconds=DISCOVERY_INTERVAL_SECONDS),
+            "args": (DISCOVERY_INCLUDE_WORKSTATION, DISCOVERY_INCLUDE_ESXI),
+        }
+    }
+
 # Conversion execution controls
 ENABLE_REAL_CONVERSION = env.bool("ENABLE_REAL_CONVERSION", default=False)
 MIGRATION_OUTPUT_DIR = env("MIGRATION_OUTPUT_DIR", default="/var/lib/vm-migrator/images")
@@ -128,10 +144,21 @@ VIRT_V2V_TIMEOUT_SECONDS = env.int("VIRT_V2V_TIMEOUT_SECONDS", default=7200)
 
 ENABLE_ROLLBACK = env.bool("ENABLE_ROLLBACK", default=True)
 
+# Minimal artifact backup (stores a copy of QCOW2 before OpenStack upload).
+ENABLE_ARTIFACT_BACKUP = env.bool("ENABLE_ARTIFACT_BACKUP", default=False)
+ARTIFACT_BACKUP_DIR = env("ARTIFACT_BACKUP_DIR", default=str(Path(MIGRATION_OUTPUT_DIR) / "backups"))
+ARTIFACT_BACKUP_REQUIRED = env.bool("ARTIFACT_BACKUP_REQUIRED", default=False)
+
+# ESXi conversion guardrails
+VMWARE_REQUIRE_NO_SNAPSHOTS = env.bool("VMWARE_REQUIRE_NO_SNAPSHOTS", default=True)
+
 # OpenStack deployment controls
 ENABLE_OPENSTACK_DEPLOYMENT = env.bool("ENABLE_OPENSTACK_DEPLOYMENT", default=False)
 OPENSTACK_CLOUD_NAME = env("OPENSTACK_CLOUD_NAME", default="openstack")
 OPENSTACK_DEFAULT_NETWORK = env("OPENSTACK_DEFAULT_NETWORK", default="")
+# Optional. When DevStack publishes a broken /image proxy endpoint, point this to Glance directly
+# (eg http://192.168.72.169:60999 after exposing it on 0.0.0.0 on the OpenStack node).
+OPENSTACK_IMAGE_ENDPOINT_OVERRIDE = env("OPENSTACK_IMAGE_ENDPOINT_OVERRIDE", default="")
 OPENSTACK_VERIFY_TIMEOUT = env.int("OPENSTACK_VERIFY_TIMEOUT", default=900)
 OPENSTACK_VERIFY_POLL_INTERVAL = env.int("OPENSTACK_VERIFY_POLL_INTERVAL", default=10)
 OPENSTACK_IMAGE_UPLOAD_TIMEOUT = env.int("OPENSTACK_IMAGE_UPLOAD_TIMEOUT", default=900)
