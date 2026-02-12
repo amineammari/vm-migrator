@@ -292,7 +292,15 @@ def ensure_volume_from_image(
     if size_gb is None:
         image = conn.image.get_image(image_id)
         image_size = int(getattr(image, "size", 0) or 0)
-        size_gb = max(1, int(ceil(image_size / (1024 ** 3)))) if image_size > 0 else 1
+        # For sparse qcow2, Glance `size` can be very small while `virtual_size`
+        # reflects the provisioned disk capacity needed by Cinder.
+        virtual_size = int(getattr(image, "virtual_size", 0) or 0)
+        min_disk_gb = int(getattr(image, "min_disk", 0) or 0)
+        bytes_gb = max(
+            int(ceil(image_size / (1024 ** 3))) if image_size > 0 else 0,
+            int(ceil(virtual_size / (1024 ** 3))) if virtual_size > 0 else 0,
+        )
+        size_gb = max(1, min_disk_gb, bytes_gb)
 
     volume = _retry_call(
         "volume create",

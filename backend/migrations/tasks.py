@@ -654,6 +654,15 @@ def _run_openstack_deployment(job: MigrationJob, discovered_vm: DiscoveredVM) ->
         retry_delay_seconds=int(getattr(settings, "OPENSTACK_API_RETRY_DELAY", 3)),
     )
 
+    # Wait for Nova to finish server build before attaching extra volumes.
+    # Attaching while vm_state=building can fail with HTTP 409.
+    server_ready_status = verify_server_active(
+        conn,
+        server_id=server_id,
+        timeout_seconds=int(getattr(settings, "OPENSTACK_VERIFY_TIMEOUT", 900)),
+        poll_interval_seconds=int(getattr(settings, "OPENSTACK_VERIFY_POLL_INTERVAL", 10)),
+    )
+
     existing_volume_ids = os_meta.get("volume_ids") if isinstance(os_meta.get("volume_ids"), list) else []
     attached_volumes: list[dict[str, Any]] = []
     volume_ids: list[str] = []
@@ -703,6 +712,7 @@ def _run_openstack_deployment(job: MigrationJob, discovered_vm: DiscoveredVM) ->
             "network_name": network.name,
             "server_id": server_id,
             "server_name": names["server_name"],
+            "server_status_before_attach": server_ready_status,
             "volume_ids": volume_ids,
             "attached_volumes": attached_volumes,
         }

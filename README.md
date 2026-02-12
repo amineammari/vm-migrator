@@ -266,3 +266,6 @@ npm run dev -- --host
 - [ ] Rollback auto-triggers on failure and reaches `ROLLED_BACK`
 - [ ] Frontend builds and loads with env-based backend URL
 - [ ] Demo flow is reproducible end-to-end
+
+
+## Just checking git commits
