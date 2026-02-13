@@ -1,6 +1,6 @@
 # VM Migration Orchestration Platform
 
-## Project Overview
+## Overview
 This platform orchestrates VM migration from VMware (Workstation/ESXi discovery source) to OpenStack with a staged, state-machine-driven workflow:
 
 1. Discover VMware VMs (read-only)
@@ -13,7 +13,7 @@ This platform orchestrates VM migration from VMware (Workstation/ESXi discovery 
 
 No authentication is enabled in this version by design.
 
-## Architecture Diagram (Textual)
+## Architecture
 
 ```text
 [React Frontend]
@@ -35,6 +35,58 @@ No authentication is enabled in this version by design.
          |- Nova (server boot)
          |- Neutron (network selection)
 ```
+
+## Project Structure
+```text
+backend/                  Django API + Celery tasks
+  core/                   Settings, URLs, logging
+  migrations/             Domain models, tasks, OpenStack/VMware clients
+  logs/                   Structured JSON logs
+frontend/                 React + Vite UI
+ansible/                  Optional conversion execution layer
+terraform/                Optional OpenStack infra provisioning
+```
+
+## Components
+- Frontend: React UI for discovery and job management
+- Backend API: Django + DRF for orchestration
+- Worker: Celery for conversion and deployment pipeline
+- Broker: Redis for task queue and results
+- Conversion: virt-v2v/qemu-img (local or via Ansible)
+- OpenStack: Glance/Nova/Neutron via openstacksdk
+- Infra: Terraform for baseline OpenStack resources (optional)
+
+## API Documentation
+Base path: `/api`
+
+Health and status:
+- `GET /api/health`
+- `GET /api/openstack/health`
+- `GET /api/tasks/<task_id>`
+
+VMware discovery:
+- `GET /api/vmware/vms`
+- `POST /api/vmware/discover-now`
+
+OpenStack inventory:
+- `GET /api/openstack/images`
+- `GET /api/openstack/flavors`
+- `GET /api/openstack/networks`
+
+Migrations:
+- `GET /api/migrations`
+- `GET /api/migrations/<job_id>`
+- `POST /api/migrations/from-vmware`
+- `POST /api/migrations/<job_id>/start`
+- `POST /api/migrations/<job_id>/rollback`
+
+OpenStack provisioning (Terraform):
+- `POST /api/openstack/provision`
+- `GET /api/openstack/provision/status`
+
+## Mock Data
+No mock data or fixtures are bundled. Use VMware discovery or create migration
+jobs via the API to populate the UI.
 
 ## Technology Stack
 - Backend: Django, Django REST Framework
@@ -64,11 +116,11 @@ Execution semantics:
 - Structured logging for API + worker paths.
 - Feature flags default to safe values (`false` for conversion/deployment).
 
-## Installation Steps
+## Installation & Setup
 
 ### 1) Backend
 ```bash
-cd /home/amin/vm-migrator-backend
+cd /home/amin/Desktop/vm-migrator/backend
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt  # if you maintain one
@@ -289,14 +341,14 @@ server {
 
 ### 1) Start backend API
 ```bash
-cd /home/amin/vm-migrator-backend
+cd /home/amin/Desktop/vm-migrator/backend
 source .venv/bin/activate
 python manage.py runserver 0.0.0.0:8000
 ```
 
 ### 2) Start Celery worker
 ```bash
-cd /home/amin/vm-migrator-backend
+cd /home/amin/Desktop/vm-migrator/backend
 source .venv/bin/activate
 celery -A core worker -l info --concurrency=${CELERY_WORKER_CONCURRENCY:-2}
 ```
@@ -306,6 +358,49 @@ celery -A core worker -l info --concurrency=${CELERY_WORKER_CONCURRENCY:-2}
 cd /home/amin/Desktop/vm-migrator/frontend
 npm run dev -- --host
 ```
+
+## Testing Scenarios
+- Smoke test OpenStack: call `GET /api/openstack/health`.
+- Verify VMware discovery populates the inventory list.
+- Run a migration with `ENABLE_REAL_CONVERSION=false` to validate state flow.
+- Run a full migration with conversion + OpenStack deploy enabled.
+- Trigger a rollback by using an invalid output path or bad network ID.
+
+## Monitoring & Observability
+- API logs: `backend/logs/app.log`
+- Worker logs: `backend/logs/worker.log`
+- Celery/Beat PID files: `backend/logs/*.pid`
+- Structured JSON logs include job IDs for correlation.
+
+## Docker Deployment
+Docker files are not included yet. If you need containers, create separate
+`Dockerfile` and `docker-compose.yml` entries for `backend`, `worker`, `beat`,
+`frontend`, and `redis`.
+
+## Kubernetes Deployment
+Kubernetes manifests are not included yet. A minimal setup typically includes:
+- Deployments: `backend`, `worker`, `beat`, `frontend`
+- Services: `backend`, `frontend`, `redis`
+- ConfigMaps/Secrets for `.env` and `clouds.yaml`
+
+## Deployment Scripts
+- Ansible conversion playbook: `ansible/playbooks/conversion.yml`
+- Terraform provisioning: `terraform/` + `python manage.py terraform_apply`
+
+## Development Guidelines
+- Keep feature flags default-safe in `.env`.
+- Use structured logging for all state transitions.
+- Prefer idempotent operations in conversion and deployment.
+- Update the README when adding new endpoints or flags.
+
+## Troubleshooting
+- OpenStack `NoValidHost`: check `devstack@n-cpu` and Nova compute status.
+- Invalid fixed IP: ensure the IP matches the chosen subnet CIDR.
+- Glance upload 502: retry or check Glance and proxy services.
+- Conversion failed: verify `virt-v2v` and VDDK settings.
+
+## Changelog
+- Unreleased
 
 ## Demo Scenario (Step-by-step)
 
@@ -373,6 +468,3 @@ npm run dev -- --host
 - [ ] Rollback auto-triggers on failure and reaches `ROLLED_BACK`
 - [ ] Frontend builds and loads with env-based backend URL
 - [ ] Demo flow is reproducible end-to-end
-
-
-## Just checking git commits
