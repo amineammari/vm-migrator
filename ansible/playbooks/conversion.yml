@@ -1,0 +1,74 @@
+---
+- name: VMware to QCOW2 conversion
+  hosts: "{{ conversion_target_group | default('conversion') }}"
+  become: "{{ (ansible_connection | default('')) != 'local' }}"
+  gather_facts: true
+
+  vars:
+    vm_name: "{{ vm_name | default('') }}"
+    output_dir: "{{ output_dir | default('/var/lib/vm-migrator/images') }}"
+    virt_v2v_command: "{{ virt_v2v_command | default('') }}"
+
+  tasks:
+    - name: Validate required input variables
+      ansible.builtin.assert:
+        that:
+          - vm_name | length > 0
+          - output_dir | length > 0
+          - virt_v2v_command | length > 0
+        fail_msg: "vm_name, output_dir and virt_v2v_command are required"
+
+    - name: Ensure conversion output directory exists
+      ansible.builtin.file:
+        path: "{{ output_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Install conversion prerequisites on Debian/Ubuntu
+      ansible.builtin.apt:
+        name:
+          - virt-v2v
+          - qemu-utils
+        state: present
+        update_cache: true
+      when:
+        - ansible_os_family == 'Debian'
+        - (ansible_connection | default('')) != 'local'
+
+    - name: Install conversion prerequisites on RHEL/CentOS/Fedora
+      ansible.builtin.package:
+        name:
+          - virt-v2v
+          - qemu-img
+        state: present
+      when:
+        - ansible_os_family in ['RedHat', 'Rocky', 'AlmaLinux', 'Fedora']
+        - (ansible_connection | default('')) != 'local'
+
+    - name: Verify virt-v2v binary
+      ansible.builtin.command: virt-v2v --version
+      register: virt_v2v_version
+      changed_when: false
+
+    - name: Verify qemu-img binary
+      ansible.builtin.command: qemu-img --version
+      register: qemu_img_version
+      changed_when: false
+
+    - name: Run remote virt-v2v conversion
+      ansible.builtin.shell: "{{ virt_v2v_command }}"
+      args:
+        executable: /bin/bash
+      register: conversion_result
+      changed_when: true
+
+    - name: Report conversion summary
+      ansible.builtin.debug:
+        msg:
+          vm_name: "{{ vm_name }}"
+          host: "{{ inventory_hostname }}"
+          virt_v2v_version: "{{ virt_v2v_version.stdout | default('unknown') }}"
+          qemu_img_version: "{{ qemu_img_version.stdout | default('unknown') }}"
+          return_code: "{{ conversion_result.rc | default(-1) }}"
+          stdout: "{{ conversion_result.stdout | default('') }}"
+          stderr: "{{ conversion_result.stderr | default('') }}"

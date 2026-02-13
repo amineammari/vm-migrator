@@ -1,3 +1,4 @@
+import json
 from datetime import timedelta
 from pathlib import Path
 
@@ -165,6 +166,32 @@ OPENSTACK_IMAGE_UPLOAD_TIMEOUT = env.int("OPENSTACK_IMAGE_UPLOAD_TIMEOUT", defau
 OPENSTACK_IMAGE_UPLOAD_POLL_INTERVAL = env.int("OPENSTACK_IMAGE_UPLOAD_POLL_INTERVAL", default=5)
 OPENSTACK_API_RETRIES = env.int("OPENSTACK_API_RETRIES", default=2)
 OPENSTACK_API_RETRY_DELAY = env.int("OPENSTACK_API_RETRY_DELAY", default=3)
+
+# Ansible conversion controls
+ENABLE_ANSIBLE_CONVERSION = env.bool("ENABLE_ANSIBLE_CONVERSION", default=False)
+ANSIBLE_PLAYBOOK_PATH = env(
+    "ANSIBLE_PLAYBOOK_PATH",
+    default=str(BASE_DIR.parent / "ansible" / "playbooks" / "conversion.yml"),
+)
+ANSIBLE_INVENTORY_PATH = env(
+    "ANSIBLE_INVENTORY_PATH",
+    default=str(BASE_DIR.parent / "ansible" / "inventory" / "hosts.ini"),
+)
+ANSIBLE_BIN = env("ANSIBLE_BIN", default="ansible-playbook")
+ANSIBLE_TIMEOUT_SECONDS = env.int("ANSIBLE_TIMEOUT_SECONDS", default=7200)
+ANSIBLE_LIMIT = env("ANSIBLE_LIMIT", default="")
+
+# Terraform infrastructure controls
+ENABLE_TERRAFORM_INFRA = env.bool("ENABLE_TERRAFORM_INFRA", default=False)
+ENABLE_TERRAFORM_FROM_CELERY = env.bool("ENABLE_TERRAFORM_FROM_CELERY", default=False)
+TERRAFORM_BIN = env("TERRAFORM_BIN", default="terraform")
+TERRAFORM_WORKING_DIR = env("TERRAFORM_WORKING_DIR", default=str(BASE_DIR.parent / "terraform"))
+TERRAFORM_TIMEOUT_SECONDS = env.int("TERRAFORM_TIMEOUT_SECONDS", default=1800)
+_tf_vars_raw = env("TERRAFORM_DEFAULT_VARS_JSON", default="{}")
+try:
+    TERRAFORM_DEFAULT_VARS = json.loads(_tf_vars_raw) if _tf_vars_raw else {}
+except json.JSONDecodeError:
+    TERRAFORM_DEFAULT_VARS = {}
 
 # Logging
 LOG_DIR = Path(env("LOG_DIR", default=str(BASE_DIR / "logs")))

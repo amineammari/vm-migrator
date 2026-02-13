@@ -10,6 +10,7 @@ import PanelState from '../components/PanelState'
 function VMwareInventoryPage() {
   const [vms, setVMs] = useState([])
   const [selectedKeys, setSelectedKeys] = useState(new Set())
+  const [specByKey, setSpecByKey] = useState({})
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
   const [submitting, setSubmitting] = useState(false)
@@ -75,10 +76,37 @@ function VMwareInventoryPage() {
     const key = makeKey(vm)
     setSelectedKeys((current) => {
       const next = new Set(current)
-      if (next.has(key)) next.delete(key)
-      else next.add(key)
+      if (next.has(key)) {
+        next.delete(key)
+        setSpecByKey((prev) => {
+          const copy = { ...prev }
+          delete copy[key]
+          return copy
+        })
+      } else {
+        next.add(key)
+        setSpecByKey((prev) => {
+          if (prev[key]) return prev
+          return {
+            ...prev,
+            [key]: buildDefaultSpec(vm),
+          }
+        })
+      }
       return next
     })
+  }
+
+  function updateSpec(vm, field, value) {
+    const key = makeKey(vm)
+    setSpecByKey((current) => ({
+      ...current,
+      [key]: {
+        ...buildDefaultSpec(vm),
+        ...(current[key] || {}),
+        [field]: value,
+      },
+    }))
   }
 
   async function migrateSelected() {
@@ -88,10 +116,18 @@ function VMwareInventoryPage() {
     setResult(null)
 
     try {
-      const payload = selectedVMs.map((vm) => ({ name: vm.name, source: vm.source }))
+      const payload = selectedVMs.map((vm) => {
+        const key = makeKey(vm)
+        const spec = specByKey[key] || buildDefaultSpec(vm)
+        const overrides = buildOverrides(spec)
+        const base = { name: vm.name, source: vm.source }
+        if (Object.keys(overrides).length) base.overrides = overrides
+        return base
+      })
       const response = await triggerMigrations(payload)
       setResult(response)
       setSelectedKeys(new Set())
+      setSpecByKey({})
     } catch (err) {
       setError(err.message || 'Migration request failed.')
     } finally {
@@ -135,6 +171,68 @@ function VMwareInventoryPage() {
                 {submitting ? 'Submitting...' : 'Migrate selected VMs'}
               </button>
             </div>
+
+            {!!selectedVMs.length && (
+              <div className="spec-form-grid">
+                {selectedVMs.map((vm) => {
+                  const key = makeKey(vm)
+                  const spec = specByKey[key] || buildDefaultSpec(vm)
+                  return (
+                    <article className="spec-card" key={`spec-${key}`}>
+                      <h4>{vm.name}</h4>
+                      <p>Adjust OpenStack target specs before starting migration.</p>
+                      <div className="spec-fields">
+                        <label>
+                          <span>CPU</span>
+                          <input
+                            type="number"
+                            min="1"
+                            value={spec.cpu}
+                            onChange={(e) => updateSpec(vm, 'cpu', e.target.value)}
+                          />
+                        </label>
+                        <label>
+                          <span>RAM (MB)</span>
+                          <input
+                            type="number"
+                            min="1"
+                            value={spec.ram}
+                            onChange={(e) => updateSpec(vm, 'ram', e.target.value)}
+                          />
+                        </label>
+                        <label>
+                          <span>Network name</span>
+                          <input
+                            type="text"
+                            value={spec.network_name}
+                            onChange={(e) => updateSpec(vm, 'network_name', e.target.value)}
+                            placeholder="private"
+                          />
+                        </label>
+                        <label>
+                          <span>Fixed IP (optional)</span>
+                          <input
+                            type="text"
+                            value={spec.fixed_ip}
+                            onChange={(e) => updateSpec(vm, 'fixed_ip', e.target.value)}
+                            placeholder="192.168.1.20"
+                          />
+                        </label>
+                        <label className="span-2">
+                          <span>Extra disks (GB, comma-separated)</span>
+                          <input
+                            type="text"
+                            value={spec.extra_disks_gb}
+                            onChange={(e) => updateSpec(vm, 'extra_disks_gb', e.target.value)}
+                            placeholder="20, 50"
+                          />
+                        </label>
+                      </div>
+                    </article>
+                  )
+                })}
+              </div>
+            )}
 
             <table className="data-table">
               <thead>
@@ -180,6 +278,87 @@ function VMwareInventoryPage() {
 
 function makeKey(vm) {
   return `${vm.source}::${vm.name}`
+}
+
+function buildDefaultSpec(vm) {
+  const metadata = vm?.metadata || {}
+  return {
+    cpu: vm?.cpu ?? '',
+    ram: vm?.ram ?? '',
+    network_name: inferNetworkName(metadata),
+    fixed_ip: inferFixedIp(metadata),
+    extra_disks_gb: '',
+  }
+}
+
+function buildOverrides(spec) {
+  const overrides = {}
+
+  const cpu = parsePositiveInteger(spec?.cpu)
+  if (cpu) overrides.cpu = cpu
+
+  const ram = parsePositiveInteger(spec?.ram)
+  if (ram) overrides.ram = ram
+
+  const extraDisks = parseDiskList(spec?.extra_disks_gb)
+  if (extraDisks.length) overrides.extra_disks_gb = extraDisks
+
+  const network = {}
+  if (typeof spec?.network_name === 'string' && spec.network_name.trim()) {
+    network.network_name = spec.network_name.trim()
+  }
+  if (typeof spec?.fixed_ip === 'string' && spec.fixed_ip.trim()) {
+    network.fixed_ip = spec.fixed_ip.trim()
+  }
+  if (Object.keys(network).length) overrides.network = network
+
+  return overrides
+}
+
+function parsePositiveInteger(value) {
+  const parsed = Number.parseInt(String(value), 10)
+  if (!Number.isFinite(parsed) || parsed <= 0) return null
+  return parsed
+}
+
+function parseDiskList(value) {
+  if (typeof value !== 'string') return []
+  return value
+    .split(',')
+    .map((part) => Number.parseInt(part.trim(), 10))
+    .filter((n) => Number.isFinite(n) && n > 0)
+}
+
+function inferNetworkName(metadata) {
+  if (!metadata || typeof metadata !== 'object') return ''
+
+  const candidates = [
+    metadata.network_name,
+    metadata.portgroup,
+    metadata.primary_network,
+    metadata.network?.name,
+    metadata.network,
+  ]
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string' && candidate.trim()) return candidate.trim()
+  }
+  return ''
+}
+
+function inferFixedIp(metadata) {
+  if (!metadata || typeof metadata !== 'object') return ''
+
+  const candidates = [
+    metadata.ip_address,
+    metadata.ip,
+    metadata.ipv4,
+    metadata.guest_ip,
+    metadata.primary_ip,
+  ]
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string' && candidate.trim()) return candidate.trim()
+  }
+  return ''
 }
 
 async function waitForTaskCompletion(taskId, timeoutMs = 60000, intervalMs = 1200) {

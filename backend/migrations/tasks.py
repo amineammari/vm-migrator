@@ -14,6 +14,7 @@ from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
 
+from .ansible_runner import AnsibleRunner, AnsibleRunnerError
 from .conversion import ConversionPlanningError, ConversionPlan, plan_vmware_conversion
 from .models import DiscoveredVM, InvalidTransitionError, MigrationJob
 from .openstack_deployment import (
@@ -25,12 +26,14 @@ from .openstack_deployment import (
     delete_server_if_exists,
     delete_volume_if_exists,
     ensure_server_booted,
+    ensure_empty_volume,
     ensure_uploaded_image,
     ensure_volume_from_image,
     map_vmware_to_flavor,
     select_default_network,
     verify_server_active,
 )
+from .terraform_runner import TerraformRunner, TerraformRunnerError
 from .vmware_client import ESXiVMwareClient, VMwareClientError, WorkstationVMwareClient
 
 logger = logging.getLogger(__name__)
@@ -339,6 +342,60 @@ def _execute_virt_v2v(plan: ConversionPlan, vm_name: str) -> dict[str, Any]:
     }
 
 
+def _execute_ansible_conversion(plan: ConversionPlan, vm_name: str) -> dict[str, Any]:
+    runner = AnsibleRunner(binary=getattr(settings, "ANSIBLE_BIN", "ansible-playbook"))
+    metadata_vars: dict[str, Any] = {
+        "vm_name": vm_name,
+        "output_dir": str(Path(plan.output_path).expanduser().parent),
+        "virt_v2v_command": plan.command,
+    }
+
+    result = runner.run_playbook(
+        playbook_path=getattr(settings, "ANSIBLE_PLAYBOOK_PATH"),
+        inventory_path=getattr(settings, "ANSIBLE_INVENTORY_PATH"),
+        extra_vars=metadata_vars,
+        limit=(getattr(settings, "ANSIBLE_LIMIT", "") or None),
+        timeout_seconds=int(getattr(settings, "ANSIBLE_TIMEOUT_SECONDS", 7200)),
+    )
+    if result["status"] != "success":
+        raise ConversionExecutionError(
+            f"Ansible conversion failed with exit code {result.get('returncode')}",
+            returncode=result.get("returncode"),
+            stdout=result.get("stdout", ""),
+            stderr=result.get("stderr", ""),
+        )
+
+    try:
+        qcow2_paths = _find_output_qcow2_paths(plan.output_path, vm_name)
+        primary_qcow2_path = _select_primary_disk(qcow2_paths, vm_name)
+    except ConversionExecutionError as exc:
+        raise ConversionExecutionError(
+            f"Ansible conversion completed but artifacts are unavailable: {exc}",
+            stdout=result.get("stdout", ""),
+            stderr=result.get("stderr", ""),
+        ) from exc
+
+    disk_sizes: dict[str, int] = {}
+    for p in qcow2_paths:
+        try:
+            disk_sizes[str(p)] = int(p.stat().st_size)
+        except OSError:
+            disk_sizes[str(p)] = 0
+
+    return {
+        "returncode": result.get("returncode", 0),
+        "duration_seconds": result.get("duration_seconds", 0),
+        "stdout": _truncate_log(result.get("stdout", "")),
+        "stderr": _truncate_log(result.get("stderr", "")),
+        "output_qcow2_path": str(primary_qcow2_path),
+        "output_qcow2_paths": [str(p) for p in qcow2_paths],
+        "disk_size": disk_sizes.get(str(primary_qcow2_path), 0),
+        "disk_sizes": disk_sizes,
+        "disk_count": len(qcow2_paths),
+        "runner": "ansible",
+    }
+
+
 def _mark_job_failed(job: MigrationJob, error_message: str) -> None:
     metadata = job.conversion_metadata if isinstance(job.conversion_metadata, dict) else {}
     metadata["last_error"] = error_message
@@ -449,6 +506,8 @@ def _rollback_openstack_resources(job: MigrationJob, actions: list[dict[str, Any
     volume_ids: list[str] = []
     if isinstance(os_meta.get("volume_ids"), list):
         volume_ids.extend([str(v) for v in os_meta.get("volume_ids") if isinstance(v, str) and v.strip()])
+    if isinstance(os_meta.get("extra_volume_ids"), list):
+        volume_ids.extend([str(v) for v in os_meta.get("extra_volume_ids") if isinstance(v, str) and v.strip()])
     volume_ids = list(dict.fromkeys(volume_ids))
 
     if not image_ids and not server_id and not volume_ids:
@@ -591,6 +650,41 @@ def _build_base_conversion_metadata(
     }
 
 
+def _effective_target_spec(job: MigrationJob, discovered_vm: DiscoveredVM) -> dict[str, Any]:
+    metadata = job.conversion_metadata if isinstance(job.conversion_metadata, dict) else {}
+    requested = metadata.get("requested_spec", {}) if isinstance(metadata.get("requested_spec"), dict) else {}
+
+    target_cpu = requested.get("cpu") if isinstance(requested.get("cpu"), int) and requested.get("cpu") > 0 else discovered_vm.cpu
+    target_ram = requested.get("ram") if isinstance(requested.get("ram"), int) and requested.get("ram") > 0 else discovered_vm.ram
+
+    network_overrides = requested.get("network", {}) if isinstance(requested.get("network"), dict) else {}
+    network_name = network_overrides.get("network_name")
+    fixed_ip = network_overrides.get("fixed_ip")
+
+    if not isinstance(network_name, str) or not network_name.strip():
+        network_name = None
+    else:
+        network_name = network_name.strip()
+
+    if not isinstance(fixed_ip, str) or not fixed_ip.strip():
+        fixed_ip = None
+    else:
+        fixed_ip = fixed_ip.strip()
+
+    raw_extra_disks = requested.get("extra_disks_gb")
+    extra_disks_gb: list[int] = []
+    if isinstance(raw_extra_disks, list):
+        extra_disks_gb = [int(v) for v in raw_extra_disks if isinstance(v, int) and v > 0]
+
+    return {
+        "cpu": target_cpu,
+        "ram": target_ram,
+        "network_name": network_name,
+        "fixed_ip": fixed_ip,
+        "extra_disks_gb": extra_disks_gb,
+    }
+
+
 def _run_openstack_deployment(job: MigrationJob, discovered_vm: DiscoveredVM) -> dict[str, Any]:
     metadata = job.conversion_metadata if isinstance(job.conversion_metadata, dict) else {}
     conversion = metadata.get("conversion", {}) if isinstance(metadata.get("conversion"), dict) else {}
@@ -614,9 +708,10 @@ def _run_openstack_deployment(job: MigrationJob, discovered_vm: DiscoveredVM) ->
 
     os_meta = metadata.get("openstack", {}) if isinstance(metadata.get("openstack"), dict) else {}
     names = build_openstack_names(job.vm_name, job.id)
+    target_spec = _effective_target_spec(job, discovered_vm)
 
-    flavor = map_vmware_to_flavor(conn, discovered_vm.cpu, discovered_vm.ram)
-    preferred_network = getattr(settings, "OPENSTACK_DEFAULT_NETWORK", "") or None
+    flavor = map_vmware_to_flavor(conn, target_spec["cpu"], target_spec["ram"])
+    preferred_network = target_spec["network_name"] or getattr(settings, "OPENSTACK_DEFAULT_NETWORK", "") or None
     network = select_default_network(conn, preferred_name=preferred_network)
 
     existing_image_ids = os_meta.get("image_ids") if isinstance(os_meta.get("image_ids"), list) else []
@@ -649,6 +744,7 @@ def _run_openstack_deployment(job: MigrationJob, discovered_vm: DiscoveredVM) ->
         image_id=primary_image_id,
         flavor_id=flavor.id,
         network_id=network.id,
+        fixed_ip=target_spec["fixed_ip"],
         existing_server_id=os_meta.get("server_id"),
         retries=int(getattr(settings, "OPENSTACK_API_RETRIES", 2)),
         retry_delay_seconds=int(getattr(settings, "OPENSTACK_API_RETRY_DELAY", 3)),
@@ -692,7 +788,45 @@ def _run_openstack_deployment(job: MigrationJob, discovered_vm: DiscoveredVM) ->
         attached_volumes.append(
             {
                 "index": idx,
+                "kind": "converted",
                 "image_id": image_id,
+                "volume_id": volume_id,
+                "status": attach_status,
+            }
+        )
+
+    extra_volume_ids = os_meta.get("extra_volume_ids") if isinstance(os_meta.get("extra_volume_ids"), list) else []
+    requested_extra_disks = target_spec["extra_disks_gb"]
+    for extra_idx, size_gb in enumerate(requested_extra_disks, start=1):
+        vol_name = f"{names['server_name']}-extra{extra_idx}"
+        existing_extra_volume_id = None
+        if (extra_idx - 1) < len(extra_volume_ids) and isinstance(extra_volume_ids[extra_idx - 1], str):
+            existing_extra_volume_id = extra_volume_ids[extra_idx - 1]
+
+        volume_id = ensure_empty_volume(
+            conn,
+            volume_name=vol_name,
+            size_gb=size_gb,
+            existing_volume_id=existing_extra_volume_id,
+            timeout_seconds=int(getattr(settings, "OPENSTACK_VERIFY_TIMEOUT", 900)),
+            poll_interval_seconds=int(getattr(settings, "OPENSTACK_IMAGE_UPLOAD_POLL_INTERVAL", 5)),
+            retries=int(getattr(settings, "OPENSTACK_API_RETRIES", 2)),
+            retry_delay_seconds=int(getattr(settings, "OPENSTACK_API_RETRY_DELAY", 3)),
+        )
+        extra_volume_ids.append(volume_id)
+
+        attach_status = attach_volume_to_server(
+            conn,
+            server_id=server_id,
+            volume_id=volume_id,
+            retries=int(getattr(settings, "OPENSTACK_API_RETRIES", 2)),
+            retry_delay_seconds=int(getattr(settings, "OPENSTACK_API_RETRY_DELAY", 3)),
+        )
+        attached_volumes.append(
+            {
+                "index": extra_idx,
+                "kind": "extra",
+                "size_gb": size_gb,
                 "volume_id": volume_id,
                 "status": attach_status,
             }
@@ -708,12 +842,17 @@ def _run_openstack_deployment(job: MigrationJob, discovered_vm: DiscoveredVM) ->
             "source_qcow2_paths": qcow2_paths,
             "flavor_id": flavor.id,
             "flavor_name": flavor.name,
+            "target_cpu": target_spec["cpu"],
+            "target_ram": target_spec["ram"],
             "network_id": network.id,
             "network_name": network.name,
+            "fixed_ip": target_spec["fixed_ip"],
             "server_id": server_id,
             "server_name": names["server_name"],
             "server_status_before_attach": server_ready_status,
             "volume_ids": volume_ids,
+            "extra_volume_ids": extra_volume_ids,
+            "requested_extra_disks_gb": requested_extra_disks,
             "attached_volumes": attached_volumes,
         }
     )
@@ -929,7 +1068,10 @@ def start_migration(job_id: int) -> dict[str, Any]:
                 job.conversion_metadata = metadata
                 job.save(update_fields=["conversion_metadata", "updated_at"])
 
-            exec_result = _execute_virt_v2v(plan, discovered_vm.name)
+            if bool(getattr(settings, "ENABLE_ANSIBLE_CONVERSION", False)):
+                exec_result = _execute_ansible_conversion(plan, discovered_vm.name)
+            else:
+                exec_result = _execute_virt_v2v(plan, discovered_vm.name)
             metadata["conversion"]["execution"] = {
                 "state": "succeeded",
                 **exec_result,
@@ -1053,7 +1195,15 @@ def start_migration(job_id: int) -> dict[str, Any]:
             "error": str(exc),
         }
 
-    except (OpenStackDeploymentError, ConversionPlanningError, InvalidTransitionError, PermissionError, OSError, subprocess.SubprocessError) as exc:
+    except (
+        OpenStackDeploymentError,
+        ConversionPlanningError,
+        AnsibleRunnerError,
+        InvalidTransitionError,
+        PermissionError,
+        OSError,
+        subprocess.SubprocessError,
+    ) as exc:
         error_message = str(exc)
         _mark_job_failed(job, error_message)
         _schedule_rollback(job, error_message)
@@ -1129,3 +1279,30 @@ def discover_vmware_vms(include_workstation: bool = True, include_esxi: bool = T
             result["esxi"]["errors"].append(str(exc))
 
     return result
+
+
+@shared_task(name="migrations.provision_openstack_infra", max_retries=0, acks_late=True)
+def provision_openstack_infra(var_overrides: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Optionally run terraform apply from Celery when explicitly enabled."""
+    if not getattr(settings, "ENABLE_TERRAFORM_INFRA", False):
+        return {"status": "skipped", "reason": "ENABLE_TERRAFORM_INFRA is false"}
+    if not getattr(settings, "ENABLE_TERRAFORM_FROM_CELERY", False):
+        return {"status": "skipped", "reason": "ENABLE_TERRAFORM_FROM_CELERY is false"}
+
+    vars_payload = dict(getattr(settings, "TERRAFORM_DEFAULT_VARS", {}))
+    if isinstance(var_overrides, dict):
+        vars_payload.update(var_overrides)
+
+    runner = TerraformRunner(binary=getattr(settings, "TERRAFORM_BIN", "terraform"))
+    try:
+        result = runner.apply(
+            working_dir=getattr(settings, "TERRAFORM_WORKING_DIR"),
+            var_overrides=vars_payload,
+            timeout_seconds=int(getattr(settings, "TERRAFORM_TIMEOUT_SECONDS", 1800)),
+            auto_approve=True,
+        )
+    except TerraformRunnerError as exc:
+        logger.error("terraform.apply.failed", extra={"error": str(exc)})
+        return {"status": "failed", "error": str(exc)}
+
+    return {"status": "success", "result": result}

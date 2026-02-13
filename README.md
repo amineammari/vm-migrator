@@ -130,6 +130,113 @@ VMWARE_ESXI_USERNAME=
 VMWARE_ESXI_PASSWORD=
 ```
 
+### Ansible conversion variables
+```env
+ENABLE_ANSIBLE_CONVERSION=false
+ANSIBLE_BIN=ansible-playbook
+ANSIBLE_PLAYBOOK_PATH=/home/amin/Desktop/vm-migrator/ansible/playbooks/conversion.yml
+ANSIBLE_INVENTORY_PATH=/home/amin/Desktop/vm-migrator/ansible/inventory/hosts.ini
+ANSIBLE_TIMEOUT_SECONDS=7200
+ANSIBLE_LIMIT=
+```
+
+### Terraform infrastructure variables
+```env
+ENABLE_TERRAFORM_INFRA=false
+ENABLE_TERRAFORM_FROM_CELERY=false
+TERRAFORM_BIN=terraform
+TERRAFORM_WORKING_DIR=/home/amin/Desktop/vm-migrator/terraform
+TERRAFORM_TIMEOUT_SECONDS=1800
+# JSON object forwarded as default -var entries.
+TERRAFORM_DEFAULT_VARS_JSON={
+  "auth_url":"http://127.0.0.1:5000/v3",
+  "username":"admin",
+  "password":"secret",
+  "project_name":"admin",
+  "domain_name":"Default",
+  "region":"RegionOne",
+  "external_network_id":"<public-network-id>"
+}
+```
+
+## Ansible Conversion Layer
+
+Directory layout:
+```text
+ansible/
+  inventory/hosts.ini
+  playbooks/conversion.yml
+```
+
+`conversion.yml` runs on the conversion host group and:
+- installs prerequisites (`virt-v2v`, `qemu`)
+- verifies binaries (`virt-v2v --version`, `qemu-img --version`)
+- executes remote `virt-v2v` command passed by Django/Celery
+- returns command result in play output
+
+### Inventory and SSH setup
+- Edit `ansible/inventory/hosts.ini` and replace `localhost` with your conversion host.
+- Ensure SSH key access from worker host to conversion host.
+- Add host key to known_hosts (recommended):
+```bash
+ssh-keyscan <conversion-host> >> ~/.ssh/known_hosts
+```
+- Verify access:
+```bash
+ansible -i ansible/inventory/hosts.ini conversion -m ping
+```
+
+### How Django/Celery calls Ansible
+- `start_migration` keeps orchestration/state machine in Celery.
+- If `ENABLE_ANSIBLE_CONVERSION=true`, task uses `AnsibleRunner` (`backend/migrations/ansible_runner.py`) instead of local subprocess execution.
+- If playbook returns non-zero, migration moves to `FAILED` and rollback flow is triggered.
+
+## Terraform Infrastructure Layer
+
+Directory layout:
+```text
+terraform/
+  provider.tf
+  variables.tf
+  network.tf
+  security.tf
+  outputs.tf
+  modules/
+    base_project/
+    network/
+    security_groups/
+```
+
+Terraform provisions baseline OpenStack resources:
+- tenant private network + subnet + router interface
+- baseline security group with SSH/ICMP ingress and IPv4 egress rule
+- project context output for orchestration-level traceability
+
+### How to provision infrastructure
+From backend virtualenv:
+```bash
+cd /home/amin/Desktop/vm-migrator/backend
+python manage.py terraform_apply
+```
+
+Override vars at runtime:
+```bash
+python manage.py terraform_apply --var external_network_id=<id> --var private_subnet_cidr=10.44.0.0/24
+```
+
+### Optional Terraform from Celery
+- Celery task `migrations.provision_openstack_infra` exists for controlled automation.
+- It is guarded by two flags:
+  - `ENABLE_TERRAFORM_INFRA=true`
+  - `ENABLE_TERRAFORM_FROM_CELERY=true`
+
+## Safety Considerations
+- Django + Celery remains the control plane; Ansible/Terraform are execution layers only.
+- Ansible and Terraform calls are logged with structured metadata (start/end, return code, duration).
+- Terraform apply is disabled by default and blocked unless explicitly enabled.
+- Ansible conversion is disabled by default; local conversion path remains available as fallback.
+- Rollback/state transitions are still managed centrally through `MigrationJob` state machine.
+
 ## Backend Hardening Notes
 Implemented:
 - `DEBUG=false` default

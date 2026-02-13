@@ -1,4 +1,9 @@
 const STATUS_CLASS = {
+  IDLE: 'status-idle',
+  QUEUED: 'status-queued',
+  RUNNING: 'status-running',
+  SUCCESS: 'status-success',
+  SKIPPED: 'status-skipped',
   PENDING: 'status-pending',
   DISCOVERED: 'status-discovered',
   CONVERTING: 'status-converting',

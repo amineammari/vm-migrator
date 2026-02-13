@@ -240,6 +240,7 @@ def ensure_server_booted(
     image_id: str,
     flavor_id: str,
     network_id: str,
+    fixed_ip: str | None = None,
     existing_server_id: str | None = None,
     retries: int = 2,
     retry_delay_seconds: int = 3,
@@ -253,6 +254,10 @@ def ensure_server_booted(
     if existing_by_name is not None:
         return existing_by_name.id
 
+    network_payload = {"uuid": network_id}
+    if fixed_ip:
+        network_payload["fixed_ip"] = fixed_ip
+
     server = _retry_call(
         "server boot",
         retries,
@@ -261,7 +266,7 @@ def ensure_server_booted(
             name=server_name,
             image_id=image_id,
             flavor_id=flavor_id,
-            networks=[{"uuid": network_id}],
+            networks=[network_payload],
         ),
     )
 
@@ -309,6 +314,54 @@ def ensure_volume_from_image(
         lambda: conn.block_storage.create_volume(
             name=volume_name,
             image_id=image_id,
+            size=size_gb,
+        ),
+    )
+
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        current = conn.block_storage.get_volume(volume.id)
+        status = str(getattr(current, "status", "")).lower()
+        if status == "available":
+            return current.id
+        if status in {"error", "error_extending"}:
+            raise OpenStackDeploymentError(
+                f"Volume '{volume_name}' entered terminal status '{status}'."
+            )
+        time.sleep(max(1, poll_interval_seconds))
+
+    raise OpenStackDeploymentError(f"Timed out waiting for volume '{volume_name}' to become available.")
+
+
+def ensure_empty_volume(
+    conn,
+    *,
+    volume_name: str,
+    size_gb: int,
+    existing_volume_id: str | None = None,
+    timeout_seconds: int = 900,
+    poll_interval_seconds: int = 5,
+    retries: int = 2,
+    retry_delay_seconds: int = 3,
+) -> str:
+    if size_gb < 1:
+        raise OpenStackDeploymentError(f"Volume '{volume_name}' size must be >= 1GB.")
+
+    if existing_volume_id:
+        existing = conn.block_storage.find_volume(existing_volume_id, ignore_missing=True)
+        if existing is not None:
+            return existing.id
+
+    existing_by_name = conn.block_storage.find_volume(volume_name, ignore_missing=True)
+    if existing_by_name is not None:
+        return existing_by_name.id
+
+    volume = _retry_call(
+        "empty volume create",
+        retries,
+        retry_delay_seconds,
+        lambda: conn.block_storage.create_volume(
+            name=volume_name,
             size=size_gb,
         ),
     )

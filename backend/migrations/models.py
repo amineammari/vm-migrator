@@ -90,3 +90,17 @@ class DiscoveredVM(models.Model):
 
     def __str__(self) -> str:
         return f"{self.name} ({self.source})"
+
+
+class OpenStackProvisioningRun(models.Model):
+    task_id = models.CharField(max_length=255, unique=True, db_index=True)
+    state = models.CharField(max_length=32, default="QUEUED")
+    message = models.TextField(blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self) -> str:
+        return f"OpenStackProvisioningRun {self.task_id} [{self.state}]"

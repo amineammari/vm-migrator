@@ -6,10 +6,15 @@ from rest_framework.exceptions import APIException
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 
-from .models import DiscoveredVM, MigrationJob
+from .models import DiscoveredVM, MigrationJob, OpenStackProvisioningRun
 from .openstack_client import OpenStackClient, OpenStackClientError
 from .serializers import CreateMigrationFromVMwareSerializer, MigrationJobSummarySerializer
-from .tasks import discover_vmware_vms, rollback_migration, start_migration
+from .tasks import (
+    discover_vmware_vms,
+    provision_openstack_infra,
+    rollback_migration,
+    start_migration,
+)
 
 
 @api_view(["GET"])
@@ -170,12 +175,16 @@ def create_migrations_from_vmware(request):
                 job = MigrationJob.objects.create(
                     vm_name=vm_name,
                     status=MigrationJob.Status.PENDING,
-                    conversion_metadata={"selected_source": source},
+                    conversion_metadata={
+                        "selected_source": source,
+                        "requested_spec": selected_vm.get("overrides", {}),
+                    },
                 )
                 created_jobs.append(
                     {
                         **MigrationJobSummarySerializer(job).data,
                         "source": source,
+                        "requested_spec": selected_vm.get("overrides", {}),
                     }
                 )
 
@@ -237,6 +246,121 @@ def rollback_migration_now(request, job_id: int):
     context = request.data if isinstance(request.data, dict) else {}
     async_result = rollback_migration.delay(job_id, context=context)
     return Response({"task_id": async_result.id, "queued": True, "job_id": job_id}, status=status.HTTP_202_ACCEPTED)
+
+
+@api_view(["POST"])
+@permission_classes([AllowAny])
+def terraform_apply_now(request):
+    """Enqueue terraform infrastructure provisioning task."""
+    body = request.data if isinstance(request.data, dict) else {}
+    var_overrides = body.get("var_overrides")
+    if not isinstance(var_overrides, dict):
+        var_overrides = {}
+    async_result = provision_openstack_infra.delay(var_overrides=var_overrides)
+    return Response({"task_id": async_result.id, "queued": True}, status=status.HTTP_202_ACCEPTED)
+
+
+def _summarize_provision_result(res: AsyncResult) -> tuple[str, str]:
+    raw_state = res.state
+    if raw_state in {"PENDING", "RECEIVED"}:
+        display_state = "QUEUED"
+        message = "Queued"
+    elif raw_state in {"STARTED", "RETRY"}:
+        display_state = "RUNNING"
+        message = "Running"
+    elif raw_state in {"FAILURE", "REVOKED"}:
+        display_state = "FAILED"
+        message = "Provisioning failed"
+    else:
+        display_state = "SUCCESS"
+        message = "Provisioning complete"
+
+    if res.ready():
+        result = res.result
+        if isinstance(result, dict):
+            result_status = str(result.get("status", "")).lower()
+            if result_status == "failed":
+                display_state = "FAILED"
+                message = result.get("error") or "Provisioning failed"
+            elif result_status == "skipped":
+                display_state = "SKIPPED"
+                message = result.get("reason") or "Provisioning skipped"
+            elif result_status == "success":
+                display_state = "SUCCESS"
+                message = "Provisioning complete"
+            else:
+                message = result.get("reason") or result.get("error") or message
+        elif result:
+            message = str(result)
+    return display_state, message
+
+
+@api_view(["POST"])
+@permission_classes([AllowAny])
+def openstack_provision_now(request):
+    """Enqueue OpenStack infra provisioning (async) and track the task id."""
+    body = request.data if isinstance(request.data, dict) else {}
+    var_overrides = body.get("var_overrides")
+    if not isinstance(var_overrides, dict):
+        var_overrides = {}
+
+    async_result = provision_openstack_infra.delay(var_overrides=var_overrides)
+    run = OpenStackProvisioningRun.objects.create(
+        task_id=async_result.id,
+        state="QUEUED",
+        message="Queued",
+    )
+    return Response(
+        {
+            "run_id": run.id,
+            "task_id": async_result.id,
+            "state": run.state,
+            "message": run.message,
+            "queued": True,
+        },
+        status=status.HTTP_202_ACCEPTED,
+    )
+
+
+@api_view(["GET"])
+@permission_classes([AllowAny])
+def openstack_provision_status(request):
+    """Return the latest OpenStack provisioning task status."""
+    run = OpenStackProvisioningRun.objects.order_by("-created_at").first()
+    if run is None:
+        return Response(
+            {
+                "state": "IDLE",
+                "message": "No provisioning runs yet.",
+                "task_id": None,
+                "run_id": None,
+                "ready": True,
+                "successful": None,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    res = AsyncResult(run.task_id)
+    display_state, message = _summarize_provision_result(res)
+
+    if run.state != display_state or run.message != message:
+        run.state = display_state
+        run.message = message
+        run.save(update_fields=["state", "message", "updated_at"])
+
+    return Response(
+        {
+            "run_id": run.id,
+            "task_id": run.task_id,
+            "state": display_state,
+            "message": message,
+            "ready": res.ready(),
+            "successful": res.successful() if res.ready() else None,
+            "created_at": run.created_at.isoformat(),
+            "updated_at": run.updated_at.isoformat(),
+        },
+        status=status.HTTP_200_OK,
+    )
 
 
 @api_view(["GET"])

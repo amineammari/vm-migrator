@@ -102,6 +102,59 @@ a {
   margin-bottom: 12px;
 }
 
+.spec-form-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.spec-card {
+  border: 1px solid #e5e7eb;
+  border-radius: 10px;
+  padding: 12px;
+  background: #f8fafc;
+}
+
+.spec-card h4 {
+  margin: 0 0 4px;
+  font-size: 1rem;
+}
+
+.spec-card p {
+  margin: 0 0 10px;
+  color: #6b7280;
+  font-size: 0.86rem;
+}
+
+.spec-fields {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.spec-fields label {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.spec-fields label span {
+  color: #4b5563;
+  font-size: 0.8rem;
+}
+
+.spec-fields input {
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  padding: 8px 9px;
+  font-size: 0.9rem;
+}
+
+.spec-fields .span-2 {
+  grid-column: span 2;
+}
+
 .primary-btn,
 .secondary-btn {
   border-radius: 8px;
@@ -164,6 +217,11 @@ a {
   font-weight: 700;
 }
 
+.status-idle { background: #f3f4f6; border-color: #d1d5db; color: #6b7280; }
+.status-queued { background: #fef9c3; border-color: #fde68a; }
+.status-running { background: #e0f2fe; border-color: #bae6fd; }
+.status-success { background: #dcfce7; border-color: #86efac; }
+.status-skipped { background: #fef3c7; border-color: #fcd34d; color: #92400e; }
 .status-pending { background: #f8fafc; border-color: #cbd5e1; }
 .status-discovered { background: #eef2ff; border-color: #c7d2fe; }
 .status-converting { background: #fff7ed; border-color: #fed7aa; }
@@ -175,7 +233,7 @@ a {
 
 .stats-grid {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
   gap: 12px;
   margin-bottom: 16px;
 }
@@ -197,6 +255,19 @@ a {
   margin-top: 6px;
   display: block;
   font-size: 1rem;
+}
+
+.stat-inline {
+  margin-top: 6px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.stat-subtext {
+  margin-top: 8px;
+  color: #6b7280;
+  font-size: 0.78rem;
 }
 
 .alert {
@@ -309,6 +380,14 @@ a {
     flex-direction: column;
     align-items: stretch;
     gap: 8px;
+  }
+
+  .spec-fields {
+    grid-template-columns: 1fr;
+  }
+
+  .spec-fields .span-2 {
+    grid-column: span 1;
   }
 
   .data-table {

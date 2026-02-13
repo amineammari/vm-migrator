@@ -1,7 +1,11 @@
 import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { fetchMigrationJobs } from '../api/migrations'
-import { fetchOpenStackHealth } from '../api/openstack'
+import {
+  fetchOpenStackHealth,
+  fetchOpenStackProvisionStatus,
+  triggerOpenStackProvision,
+} from '../api/openstack'
 import PanelState from '../components/PanelState'
 import StatusBadge from '../components/StatusBadge'
 
@@ -10,18 +14,25 @@ const POLL_INTERVAL_MS = 5000
 function MigrationJobsPage() {
   const [jobs, setJobs] = useState([])
   const [health, setHealth] = useState(null)
+  const [provisioning, setProvisioning] = useState(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
+  const [provisioningBusy, setProvisioningBusy] = useState(false)
 
   useEffect(() => {
     let mounted = true
 
     async function load() {
       try {
-        const [jobItems, healthData] = await Promise.all([fetchMigrationJobs(), fetchOpenStackHealth()])
+        const [jobItems, healthData, provisionData] = await Promise.all([
+          fetchMigrationJobs(),
+          fetchOpenStackHealth(),
+          fetchOpenStackProvisionStatus(),
+        ])
         if (!mounted) return
         setJobs(jobItems)
         setHealth(healthData)
+        setProvisioning(provisionData)
         setError('')
       } catch (err) {
         if (!mounted) return
@@ -39,12 +50,37 @@ function MigrationJobsPage() {
     }
   }, [])
 
+  async function handleProvision() {
+    setProvisioningBusy(true)
+    setError('')
+    try {
+      await triggerOpenStackProvision()
+      const provisionData = await fetchOpenStackProvisionStatus()
+      setProvisioning(provisionData)
+    } catch (err) {
+      setError(err.message || 'Failed to trigger OpenStack provisioning.')
+    } finally {
+      setProvisioningBusy(false)
+    }
+  }
+
+  const provisioningActive = ['QUEUED', 'RUNNING'].includes(provisioning?.state)
+
   return (
     <section>
       <div className="page-header">
         <div>
           <h2>Migration Jobs Dashboard</h2>
           <p>Live status of migration workflow states with auto-refresh.</p>
+        </div>
+        <div className="header-actions">
+          <button
+            className="primary-btn"
+            onClick={handleProvision}
+            disabled={provisioningBusy || provisioningActive}
+          >
+            Provision OpenStack Infra
+          </button>
         </div>
       </div>
 
@@ -66,6 +102,15 @@ function MigrationJobsPage() {
         <div className="stat-card">
           <p>Networks</p>
           <strong>{health?.network_count ?? '-'}</strong>
+        </div>
+        <div className="stat-card">
+          <p>Infra provisioning</p>
+          <div className="stat-inline">
+            <StatusBadge status={provisioning?.state || 'IDLE'} />
+          </div>
+          <div className="stat-subtext">
+            {provisioning?.message || 'No provisioning runs yet.'}
+          </div>
         </div>
       </div>
 
