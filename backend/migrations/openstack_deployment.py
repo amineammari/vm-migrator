@@ -87,8 +87,20 @@ def _connect_kwargs_from_env() -> dict[str, Any] | None:
     return kwargs
 
 
-def connect_openstack(cloud: str = "openstack"):
+def connect_openstack(cloud: str = "openstack", auth_overrides: dict[str, Any] | None = None):
     try:
+        if isinstance(auth_overrides, dict) and auth_overrides:
+            conn = openstack.connect(
+                cloud=None,
+                load_yaml_config=False,
+                load_envvars=False,
+                app_name="vm-migrator",
+                app_version="1",
+                **auth_overrides,
+            )
+            conn.authorize()
+            return conn
+
         env_kwargs = _connect_kwargs_from_env()
         if env_kwargs:
             conn = openstack.connect(
@@ -157,10 +169,23 @@ def map_vmware_to_flavor(conn, cpu: int | None, ram_mb: int | None) -> FlavorCho
     return FlavorChoice(id=picked.id, name=picked.name, vcpus=int(picked.vcpus), ram=int(picked.ram))
 
 
-def select_default_network(conn, preferred_name: str | None = None):
+def get_flavor_choice_by_id(conn, flavor_id: str) -> FlavorChoice:
+    flavor = conn.compute.find_flavor(flavor_id, ignore_missing=True)
+    if flavor is None:
+        raise OpenStackDeploymentError(f"Flavor '{flavor_id}' not found.")
+    return FlavorChoice(id=flavor.id, name=flavor.name, vcpus=int(flavor.vcpus), ram=int(flavor.ram))
+
+
+def select_default_network(conn, preferred_name: str | None = None, preferred_id: str | None = None):
     networks = list(conn.network.networks())
     if not networks:
         raise OpenStackDeploymentError("No networks available for server boot.")
+
+    if preferred_id:
+        preferred = conn.network.find_network(preferred_id, ignore_missing=True)
+        if preferred is None:
+            raise OpenStackDeploymentError(f"Preferred network '{preferred_id}' not found.")
+        return preferred
 
     if preferred_name:
         preferred = next((n for n in networks if getattr(n, "name", None) == preferred_name), None)
@@ -180,6 +205,7 @@ def ensure_uploaded_image(
     *,
     qcow2_path: str,
     image_name: str,
+    disk_format: str = "qcow2",
     existing_image_id: str | None = None,
     timeout_seconds: int = 900,
     poll_interval_seconds: int = 5,
@@ -188,7 +214,9 @@ def ensure_uploaded_image(
 ) -> str:
     path = Path(qcow2_path).expanduser()
     if not path.exists() or not path.is_file():
-        raise OpenStackDeploymentError(f"QCOW2 artifact not found for upload: {path}")
+        raise OpenStackDeploymentError(f"Disk artifact not found for upload: {path}")
+    if disk_format not in {"qcow2", "raw"}:
+        raise OpenStackDeploymentError(f"Unsupported Glance disk format '{disk_format}'. Use qcow2 or raw.")
 
     if existing_image_id:
         existing = conn.image.find_image(existing_image_id, ignore_missing=True)
@@ -209,7 +237,7 @@ def ensure_uploaded_image(
         lambda: conn.image.create_image(
             image_name,
             filename=str(path),
-            disk_format="qcow2",
+            disk_format=disk_format,
             container_format="bare",
             visibility="private",
             wait=False,
@@ -267,6 +295,57 @@ def ensure_server_booted(
             image_id=image_id,
             flavor_id=flavor_id,
             networks=[network_payload],
+        ),
+    )
+
+    return server.id
+
+
+def ensure_server_booted_from_volume(
+    conn,
+    *,
+    server_name: str,
+    boot_volume_id: str,
+    flavor_id: str,
+    network_id: str,
+    fixed_ip: str | None = None,
+    existing_server_id: str | None = None,
+    retries: int = 2,
+    retry_delay_seconds: int = 3,
+) -> str:
+    if existing_server_id:
+        existing = conn.compute.find_server(existing_server_id, ignore_missing=True)
+        if existing is not None:
+            return existing.id
+
+    existing_by_name = conn.compute.find_server(server_name, ignore_missing=True)
+    if existing_by_name is not None:
+        return existing_by_name.id
+
+    network_payload = {"uuid": network_id}
+    if fixed_ip:
+        network_payload["fixed_ip"] = fixed_ip
+
+    block_device_mapping_v2 = [
+        {
+            "uuid": boot_volume_id,
+            "source_type": "volume",
+            "destination_type": "volume",
+            "boot_index": 0,
+            "delete_on_termination": False,
+        }
+    ]
+
+    server = _retry_call(
+        "server boot from volume",
+        retries,
+        retry_delay_seconds,
+        lambda: conn.compute.create_server(
+            name=server_name,
+            image_id=None,
+            flavor_id=flavor_id,
+            networks=[network_payload],
+            block_device_mapping_v2=block_device_mapping_v2,
         ),
     )
 

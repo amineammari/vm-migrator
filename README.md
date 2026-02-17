@@ -67,11 +67,15 @@ Health and status:
 VMware discovery:
 - `GET /api/vmware/vms`
 - `POST /api/vmware/discover-now`
+- `POST /api/vmware/endpoints/test`
+- `POST /api/vmware/endpoints/connect`
 
 OpenStack inventory:
 - `GET /api/openstack/images`
 - `GET /api/openstack/flavors`
 - `GET /api/openstack/networks`
+- `POST /api/openstack/endpoints/test`
+- `POST /api/openstack/endpoints/connect`
 
 Migrations:
 - `GET /api/migrations`

@@ -106,40 +106,31 @@ def plan_vmware_conversion(
                 if len(input_disks) > 1:
                     notes.append("multi-disk VM detected; conversion uses VMX import to preserve all disks")
             else:
-                notes.append(f"vmx_path not found ({vmx}); falling back to first disk conversion")
+                notes.append(
+                    f"vmx_path not found ({vmx}); using qemu-img per-disk workflow to keep 1-to-1 disk architecture"
+                )
                 command_args = [
-                    "virt-v2v",
-                    "-i",
-                    "disk",
-                    input_disks[0],
-                    "-o",
-                    "local",
-                    "-os",
-                    str(output_dir),
-                    "-of",
+                    "qemu-img",
+                    "convert",
+                    "-f",
+                    "<detected>",
+                    "-O",
                     "qcow2",
-                    "-on",
-                    discovered_vm.name,
+                    "<source-disk>",
+                    "<target-disk>",
                 ]
-                if len(input_disks) > 1:
-                    notes.append("fallback mode uses first disk only")
         else:
+            notes.append("vmx_path unavailable; using qemu-img per-disk workflow (1-to-1, same order, no merge)")
             command_args = [
-                "virt-v2v",
-                "-i",
-                "disk",
-                input_disks[0],
-                "-o",
-                "local",
-                "-os",
-                str(output_dir),
-                "-of",
+                "qemu-img",
+                "convert",
+                "-f",
+                "<detected>",
+                "-O",
                 "qcow2",
-                "-on",
-                discovered_vm.name,
+                "<source-disk>",
+                "<target-disk>",
             ]
-            if len(input_disks) > 1:
-                notes.append("vmx_path unavailable; fallback mode uses first disk only")
 
         return ConversionPlan(
             command=_build_command(command_args),

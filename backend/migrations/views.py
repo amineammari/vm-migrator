@@ -1,4 +1,5 @@
 from django.db import transaction
+from django.utils import timezone
 from celery.result import AsyncResult
 from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes
@@ -6,15 +7,27 @@ from rest_framework.exceptions import APIException
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 
-from .models import DiscoveredVM, MigrationJob, OpenStackProvisioningRun
+from .models import (
+    DiscoveredVM,
+    MigrationJob,
+    OpenstackEndpointSession,
+    OpenStackProvisioningRun,
+    VmwareEndpointSession,
+)
 from .openstack_client import OpenStackClient, OpenStackClientError
-from .serializers import CreateMigrationFromVMwareSerializer, MigrationJobSummarySerializer
+from .serializers import (
+    CreateMigrationFromVMwareSerializer,
+    MigrationJobSummarySerializer,
+    OpenstackEndpointConnectSerializer,
+    VmwareEndpointConnectSerializer,
+)
 from .tasks import (
     discover_vmware_vms,
     provision_openstack_infra,
     rollback_migration,
     start_migration,
 )
+from .vmware_client import ESXiVMwareClient, VMwareClientError
 
 
 @api_view(["GET"])
@@ -74,16 +87,79 @@ def openstack_networks(request):
     """Read-only list of OpenStack networks."""
     try:
         client = OpenStackClient(cloud="openstack")
-        return Response({"items": client.list_networks()}, status=status.HTTP_200_OK)
+        return Response({"items": client.list_networks_detail()}, status=status.HTTP_200_OK)
     except OpenStackClientError as exc:
         return Response({"error": str(exc)}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
 
 
-@api_view(["GET"])
+@api_view(["POST"])
 @permission_classes([AllowAny])
-def vmware_vms(request):
-    """Return discovered VMware VMs from local persistence (read-only API)."""
-    qs = DiscoveredVM.objects.order_by("-last_seen", "name")
+def vmware_endpoint_test(request):
+    serializer = VmwareEndpointConnectSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+    payload = serializer.validated_data
+    try:
+        client = ESXiVMwareClient(
+            host=payload["host"],
+            username=payload["username"],
+            password=payload["password"],
+            port=payload["port"],
+            insecure=payload["insecure"],
+        )
+        items = client.discover_vms()
+        return Response(
+            {
+                "ok": True,
+                "message": "Connection successful.",
+                "vm_count": len(items),
+            },
+            status=status.HTTP_200_OK,
+        )
+    except VMwareClientError as exc:
+        return Response({"ok": False, "message": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+
+@api_view(["POST"])
+@permission_classes([AllowAny])
+def vmware_endpoint_connect(request):
+    serializer = VmwareEndpointConnectSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+    payload = serializer.validated_data
+
+    try:
+        session = VmwareEndpointSession.objects.create(
+            label=payload.get("label", ""),
+            host=payload["host"],
+            port=payload["port"],
+            username=payload["username"],
+            password=payload["password"],
+            insecure=payload["insecure"],
+            last_test_status=VmwareEndpointSession.TestStatus.PASSED,
+            last_test_message="Connection successful.",
+            last_test_at=timezone.now(),
+        )
+        result = discover_vmware_vms(
+            include_workstation=False,
+            include_esxi=True,
+            vmware_endpoint_session_id=session.id,
+        )
+        esxi_result = result.get("esxi", {}) if isinstance(result, dict) else {}
+        if esxi_result.get("errors"):
+            session.last_test_status = VmwareEndpointSession.TestStatus.FAILED
+            session.last_test_message = str(esxi_result.get("errors", ["Unknown error"])[0])
+            session.last_test_at = timezone.now()
+            session.save(update_fields=["last_test_status", "last_test_message", "last_test_at", "updated_at"])
+            return Response(
+                {"ok": False, "message": session.last_test_message},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+    except VMwareClientError as exc:
+        return Response({"ok": False, "message": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+    items_qs = DiscoveredVM.objects.filter(
+        source=DiscoveredVM.Source.ESXI,
+        vmware_endpoint_session_id=session.id,
+    ).order_by("-last_seen", "name")
     items = [
         {
             "id": vm.id,
@@ -92,9 +168,168 @@ def vmware_vms(request):
             "cpu": vm.cpu,
             "ram": vm.ram,
             "disks": vm.disks,
+            "nics": vm.metadata.get("nics", []) if isinstance(vm.metadata, dict) else [],
+            "guest_ip": vm.metadata.get("guest", {}).get("ip_address")
+            if isinstance(vm.metadata, dict) and isinstance(vm.metadata.get("guest"), dict)
+            else None,
             "metadata": vm.metadata,
             "power_state": vm.power_state,
             "last_seen": vm.last_seen.isoformat(),
+            "vmware_endpoint_session_id": session.id,
+        }
+        for vm in items_qs
+    ]
+    return Response(
+        {
+            "ok": True,
+            "vmware_endpoint_session": {
+                "id": session.id,
+                "label": session.label,
+                "host": session.host,
+                "port": session.port,
+                "username": session.username,
+                "insecure": session.insecure,
+                "last_test_status": session.last_test_status,
+                "last_test_at": session.last_test_at.isoformat() if session.last_test_at else None,
+            },
+            "items": items,
+        },
+        status=status.HTTP_200_OK,
+    )
+
+
+@api_view(["POST"])
+@permission_classes([AllowAny])
+def openstack_endpoint_test(request):
+    serializer = OpenstackEndpointConnectSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+    payload = serializer.validated_data
+    connect_kwargs = {
+        "auth_url": payload["auth_url"],
+        "username": payload["username"],
+        "password": payload["password"],
+        "project_name": payload["project_name"],
+        "user_domain_name": payload.get("user_domain_name", "Default"),
+        "project_domain_name": payload.get("project_domain_name", "Default"),
+        "verify": payload.get("verify", False),
+    }
+    if payload.get("region_name"):
+        connect_kwargs["region_name"] = payload["region_name"]
+    if payload.get("interface"):
+        connect_kwargs["interface"] = payload["interface"]
+    if payload.get("identity_api_version"):
+        connect_kwargs["identity_api_version"] = payload["identity_api_version"]
+    if payload.get("image_endpoint_override"):
+        connect_kwargs["image_endpoint_override"] = payload["image_endpoint_override"]
+
+    try:
+        client = OpenStackClient(auth_config=connect_kwargs)
+        project_id = client.validate_connection()
+        images = client.list_images()
+        flavors = client.list_flavors()
+        networks = client.list_networks()
+        return Response(
+            {
+                "ok": True,
+                "message": "Connection successful.",
+                "project_id": project_id,
+                "image_count": len(images),
+                "flavor_count": len(flavors),
+                "network_count": len(networks),
+            },
+            status=status.HTTP_200_OK,
+        )
+    except OpenStackClientError as exc:
+        return Response({"ok": False, "message": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+
+@api_view(["POST"])
+@permission_classes([AllowAny])
+def openstack_endpoint_connect(request):
+    serializer = OpenstackEndpointConnectSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+    payload = serializer.validated_data
+
+    session = OpenstackEndpointSession.objects.create(
+        label=payload.get("label", ""),
+        auth_url=payload["auth_url"],
+        username=payload["username"],
+        password=payload["password"],
+        project_name=payload["project_name"],
+        user_domain_name=payload.get("user_domain_name", "Default"),
+        project_domain_name=payload.get("project_domain_name", "Default"),
+        region_name=payload.get("region_name", ""),
+        interface=payload.get("interface", ""),
+        identity_api_version=payload.get("identity_api_version", ""),
+        verify=payload.get("verify", False),
+        image_endpoint_override=payload.get("image_endpoint_override", ""),
+        last_test_status=OpenstackEndpointSession.TestStatus.PASSED,
+        last_test_message="Connection successful.",
+        last_test_at=timezone.now(),
+    )
+    try:
+        client = OpenStackClient(auth_config=session.to_connect_kwargs())
+        project_id = client.validate_connection()
+        images = client.list_images()
+        flavors = client.list_flavors()
+        networks = client.list_networks_detail()
+    except OpenStackClientError as exc:
+        session.last_test_status = OpenstackEndpointSession.TestStatus.FAILED
+        session.last_test_message = str(exc)
+        session.last_test_at = timezone.now()
+        session.save(update_fields=["last_test_status", "last_test_message", "last_test_at", "updated_at"])
+        return Response({"ok": False, "message": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+    return Response(
+        {
+            "ok": True,
+            "openstack_endpoint_session": {
+                "id": session.id,
+                "label": session.label,
+                "auth_url": session.auth_url,
+                "username": session.username,
+                "project_name": session.project_name,
+                "region_name": session.region_name,
+                "verify": session.verify,
+                "last_test_status": session.last_test_status,
+                "last_test_at": session.last_test_at.isoformat() if session.last_test_at else None,
+            },
+            "project_id": project_id,
+            "images": images,
+            "flavors": flavors,
+            "networks": networks,
+        },
+        status=status.HTTP_200_OK,
+    )
+
+
+@api_view(["GET"])
+@permission_classes([AllowAny])
+def vmware_vms(request):
+    """Return discovered VMware VMs from local persistence (read-only API)."""
+    endpoint_session_id = request.query_params.get("endpoint_session_id")
+    qs = DiscoveredVM.objects.order_by("-last_seen", "name")
+    if endpoint_session_id:
+        try:
+            qs = qs.filter(vmware_endpoint_session_id=int(endpoint_session_id))
+        except (TypeError, ValueError):
+            return Response({"error": "Invalid endpoint_session_id query parameter."}, status=status.HTTP_400_BAD_REQUEST)
+    items = [
+        {
+            "id": vm.id,
+            "name": vm.name,
+            "source": vm.source,
+            "cpu": vm.cpu,
+            "ram": vm.ram,
+            "disks": vm.disks,
+            "nics": vm.metadata.get("nics", []) if isinstance(vm.metadata, dict) else [],
+            "guest_ip": vm.metadata.get("guest", {}).get("ip_address")
+            if isinstance(vm.metadata, dict) and isinstance(vm.metadata.get("guest"), dict)
+            else None,
+            "metadata": vm.metadata,
+            "power_state": vm.power_state,
+            "last_seen": vm.last_seen.isoformat(),
+            "vmware_endpoint_session_id": vm.vmware_endpoint_session_id,
         }
         for vm in qs
     ]
@@ -120,6 +355,10 @@ def migration_detail(request, job_id: int):
 
     payload = MigrationJobSummarySerializer(job).data
     payload["conversion_metadata"] = job.conversion_metadata
+    conversion = job.conversion_metadata if isinstance(job.conversion_metadata, dict) else {}
+    conversion_stage = conversion.get("conversion", {}) if isinstance(conversion.get("conversion"), dict) else {}
+    execution = conversion_stage.get("execution", {}) if isinstance(conversion_stage.get("execution"), dict) else {}
+    payload["disk_analysis"] = execution.get("disk_analysis", [])
     return Response(payload, status=status.HTTP_200_OK)
 
 
@@ -130,6 +369,8 @@ def create_migrations_from_vmware(request):
     serializer = CreateMigrationFromVMwareSerializer(data=request.data, context={})
     serializer.is_valid(raise_exception=True)
 
+    vmware_endpoint_session = serializer.context["vmware_endpoint_session"]
+    openstack_endpoint_session = serializer.context["openstack_endpoint_session"]
     selected_vms = serializer.validated_data["vms"]
 
     active_statuses = [
@@ -156,7 +397,11 @@ def create_migrations_from_vmware(request):
                 for candidate in candidates:
                     meta = candidate.conversion_metadata if isinstance(candidate.conversion_metadata, dict) else {}
                     existing_source = meta.get("selected_source")
-                    if existing_source in (None, source):
+                    existing_vmware_endpoint_session_id = meta.get("selected_vmware_endpoint_session_id")
+                    if existing_source in (None, source) and existing_vmware_endpoint_session_id in (
+                        None,
+                        vmware_endpoint_session.id,
+                    ):
                         existing_job = candidate
                         break
 
@@ -177,6 +422,8 @@ def create_migrations_from_vmware(request):
                     status=MigrationJob.Status.PENDING,
                     conversion_metadata={
                         "selected_source": source,
+                        "selected_vmware_endpoint_session_id": vmware_endpoint_session.id,
+                        "selected_openstack_endpoint_session_id": openstack_endpoint_session.id,
                         "requested_spec": selected_vm.get("overrides", {}),
                     },
                 )
@@ -184,6 +431,8 @@ def create_migrations_from_vmware(request):
                     {
                         **MigrationJobSummarySerializer(job).data,
                         "source": source,
+                        "vmware_endpoint_session_id": vmware_endpoint_session.id,
+                        "openstack_endpoint_session_id": openstack_endpoint_session.id,
                         "requested_spec": selected_vm.get("overrides", {}),
                     }
                 )
@@ -215,10 +464,17 @@ def discover_now(request):
     body = request.data if isinstance(request.data, dict) else {}
     include_workstation = bool(body.get("include_workstation", True))
     include_esxi = bool(body.get("include_esxi", True))
+    vmware_endpoint_session_id = body.get("vmware_endpoint_session_id")
+    if vmware_endpoint_session_id is not None:
+        try:
+            vmware_endpoint_session_id = int(vmware_endpoint_session_id)
+        except (TypeError, ValueError):
+            return Response({"error": "vmware_endpoint_session_id must be an integer."}, status=status.HTTP_400_BAD_REQUEST)
 
     async_result = discover_vmware_vms.delay(
         include_workstation=include_workstation,
         include_esxi=include_esxi,
+        vmware_endpoint_session_id=vmware_endpoint_session_id,
     )
     return Response(
         {
@@ -226,6 +482,7 @@ def discover_now(request):
             "queued": True,
             "include_workstation": include_workstation,
             "include_esxi": include_esxi,
+            "vmware_endpoint_session_id": vmware_endpoint_session_id,
         },
         status=status.HTTP_202_ACCEPTED,
     )

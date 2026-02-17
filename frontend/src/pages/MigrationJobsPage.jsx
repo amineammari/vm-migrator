@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { fetchMigrationJobs } from '../api/migrations'
 import {
@@ -65,6 +65,15 @@ function MigrationJobsPage() {
   }
 
   const provisioningActive = ['QUEUED', 'RUNNING'].includes(provisioning?.state)
+  const jobStats = useMemo(() => {
+    const total = jobs.length
+    const active = jobs.filter((job) =>
+      ['PENDING', 'DISCOVERED', 'CONVERTING', 'UPLOADING', 'DEPLOYED'].includes(job.status),
+    ).length
+    const failed = jobs.filter((job) => ['FAILED', 'ROLLED_BACK'].includes(job.status)).length
+    const verified = jobs.filter((job) => job.status === 'VERIFIED').length
+    return { total, active, failed, verified }
+  }, [jobs])
 
   return (
     <section>
@@ -89,7 +98,7 @@ function MigrationJobsPage() {
       <div className="stats-grid">
         <div className="stat-card">
           <p>OpenStack project</p>
-          <strong>{health?.project_id || '-'}</strong>
+          <strong className="mono">{health?.project_id || '-'}</strong>
         </div>
         <div className="stat-card">
           <p>Images</p>
@@ -112,6 +121,11 @@ function MigrationJobsPage() {
             {provisioning?.message || 'No provisioning runs yet.'}
           </div>
         </div>
+        <div className="stat-card">
+          <p>Jobs total</p>
+          <strong>{jobStats.total}</strong>
+          <div className="stat-subtext">Active: {jobStats.active} • Verified: {jobStats.verified} • Failed: {jobStats.failed}</div>
+        </div>
       </div>
 
       <div className="panel">
@@ -120,32 +134,41 @@ function MigrationJobsPage() {
         ) : jobs.length === 0 ? (
           <PanelState title="No jobs yet" message="Trigger migrations from VMware inventory to populate this table." />
         ) : (
-          <table className="data-table">
-            <thead>
-              <tr>
-                <th>VM name</th>
-                <th>Status</th>
-                <th>Created at</th>
-                <th>Details</th>
-              </tr>
-            </thead>
-            <tbody>
-              {jobs.map((job) => (
-                <tr key={job.id}>
-                  <td>{job.vm_name}</td>
-                  <td>
-                    <StatusBadge status={job.status} />
-                  </td>
-                  <td>{formatDate(job.created_at)}</td>
-                  <td>
-                    <Link className="text-link" to={`/migrations/${job.id}`}>
-                      View
-                    </Link>
-                  </td>
+          <div className="table-wrap">
+            <table className="data-table">
+              <thead>
+                <tr>
+                  <th>Job</th>
+                  <th>Status</th>
+                  <th>Created at</th>
+                  <th>Updated at</th>
+                  <th>Details</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {jobs.map((job) => (
+                  <tr key={job.id} className="vm-row">
+                    <td>
+                      <div className="vm-name-cell">
+                        <strong>{job.vm_name}</strong>
+                        <span>Job #{job.id}</span>
+                      </div>
+                    </td>
+                    <td>
+                      <StatusBadge status={job.status} />
+                    </td>
+                    <td>{formatDate(job.created_at)}</td>
+                    <td>{formatDate(job.updated_at)}</td>
+                    <td>
+                      <Link className="text-link" to={`/migrations/${job.id}`}>
+                        Open
+                      </Link>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         )}
       </div>
     </section>

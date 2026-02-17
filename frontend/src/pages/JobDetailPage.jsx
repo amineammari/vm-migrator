@@ -55,28 +55,37 @@ function JobDetailPage() {
         ) : (
           <>
             <section className="detail-block">
-              <h3>Job metadata</h3>
+              <h3>Execution Summary</h3>
               <div className="detail-grid">
                 <Detail label="ID" value={job.id} />
                 <Detail label="VM name" value={job.vm_name} />
                 <Detail label="Status" value={<StatusBadge status={job.status} />} />
                 <Detail label="Created" value={formatDate(job.created_at)} />
                 <Detail label="Updated" value={formatDate(job.updated_at)} />
+                <Detail
+                  label="Source"
+                  value={job.conversion_metadata?.selected_source || '-'}
+                />
               </div>
             </section>
 
             <section className="detail-block">
-              <h3>Conversion info</h3>
+              <h3>Conversion Plan</h3>
               <pre className="json-block">{prettyJson(job.conversion_metadata?.conversion)}</pre>
             </section>
 
             <section className="detail-block">
-              <h3>OpenStack deployment info</h3>
+              <h3>Disk Analysis</h3>
+              <pre className="json-block">{prettyJson(job.disk_analysis)}</pre>
+            </section>
+
+            <section className="detail-block">
+              <h3>OpenStack Deployment</h3>
               <pre className="json-block">{prettyJson(job.conversion_metadata?.openstack)}</pre>
             </section>
 
             <section className="detail-block">
-              <h3>Rollback info</h3>
+              <h3>Rollback</h3>
               <pre className="json-block">
                 {prettyJson({
                   rollback_at: job.conversion_metadata?.rollback_at,
@@ -96,7 +105,7 @@ function Detail({ label, value }) {
   return (
     <div className="detail-item">
       <span>{label}</span>
-      <strong>{value || '-'}</strong>
+      <strong className="detail-value">{value || '-'}</strong>
     </div>
   )
 }
