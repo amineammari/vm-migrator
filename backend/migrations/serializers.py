@@ -24,7 +24,7 @@ class VMOverridesSerializer(serializers.Serializer):
         allow_empty=True,
     )
     network = NetworkOverrideSerializer(required=False)
-    # Merge/concat is explicitly forbidden: migration keeps 1-to-1 disk topology.
+    # Backward-compatible flag. When true, it maps to disk_layout_mode=concat.
     disk_merge = serializers.BooleanField(required=False, default=False)
     disk_layout_mode = serializers.CharField(required=False, allow_blank=True)
 
@@ -32,11 +32,20 @@ class VMOverridesSerializer(serializers.Serializer):
         disk_layout_mode = str(attrs.get("disk_layout_mode", "") or "").strip().lower()
         disk_merge = bool(attrs.get("disk_merge", False))
 
-        if disk_merge or disk_layout_mode in {"merge", "concat", "concatenate"}:
+        if disk_layout_mode and disk_layout_mode not in {"individual", "concat", "merge", "concatenate"}:
             raise serializers.ValidationError(
-                "Disk concatenation/merge is not allowed. Disk architecture must remain unchanged "
-                "(1-to-1: same number of disks, same order, no merge)."
+                "Invalid disk_layout_mode. Use 'individual' or 'concat'."
             )
+        if disk_merge and disk_layout_mode in {"individual"}:
+            raise serializers.ValidationError(
+                "Conflicting disk settings: disk_merge=true cannot be combined with disk_layout_mode='individual'."
+            )
+        if disk_merge and not disk_layout_mode:
+            attrs["disk_layout_mode"] = "concat"
+        elif disk_layout_mode in {"merge", "concatenate"}:
+            attrs["disk_layout_mode"] = "concat"
+        elif not disk_layout_mode:
+            attrs["disk_layout_mode"] = "individual"
         return attrs
 
 

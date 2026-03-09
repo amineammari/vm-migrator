@@ -17,8 +17,22 @@ from django.db import transaction
 from django.utils import timezone
 
 from .ansible_runner import AnsibleRunner, AnsibleRunnerError
+from .block_validation import BlockValidationError, validate_qcow2_images
 from .conversion import ConversionPlanningError, ConversionPlan, plan_vmware_conversion
+from .disk_inspection import (
+    DiskInspectionError,
+    collect_local_disk_metadata,
+    collect_source_disk_inventory,
+    concatenate_disk_images,
+    infer_sparse_candidate,
+    validate_disk_sources_for_precheck,
+)
 from .disk_formats import DiskConversionError, convert_to_openstack_compatible, detect_disk_format
+from .filesystem_check import (
+    FilesystemCheckError,
+    compare_partition_layout,
+    run_filesystem_consistency_check,
+)
 from .models import (
     DiscoveredVM,
     InvalidTransitionError,
@@ -44,6 +58,7 @@ from .openstack_deployment import (
     verify_server_active,
 )
 from .terraform_runner import TerraformRunner, TerraformRunnerError
+from .snapshot_manager import SnapshotError, create_vm_snapshot
 from .vmware_client import ESXiVMwareClient, VMwareClientError, WorkstationVMwareClient
 
 logger = logging.getLogger(__name__)
@@ -422,7 +437,101 @@ def _order_qcow2_paths_for_boot(paths: list[Path], vm_name: str) -> tuple[list[P
     return paths, primary, primary_index, inspected
 
 
-def _execute_workstation_qemu_pipeline(plan: ConversionPlan, vm_name: str) -> dict[str, Any]:
+def _apply_disk_layout_mode(
+    *,
+    paths: list[Path],
+    output_dir: Path,
+    vm_name: str,
+    disk_layout_mode: str,
+    prefer_sparse_output: bool,
+) -> tuple[list[Path], dict[str, Any] | None]:
+    if disk_layout_mode != "concat" or len(paths) <= 1:
+        return paths, None
+
+    merged_path = output_dir / f"{_sanitize_name(vm_name)}-merged.qcow2"
+    concat_report = concatenate_disk_images(
+        input_paths=[str(p) for p in paths],
+        output_path=str(merged_path),
+        timeout_seconds=int(getattr(settings, "QEMU_IMG_TIMEOUT_SECONDS", 3600)),
+        sparse=prefer_sparse_output,
+    )
+    return [merged_path], concat_report
+
+
+def _build_precheck_report(discovered_vm: DiscoveredVM, plan: ConversionPlan) -> dict[str, Any]:
+    errors = validate_disk_sources_for_precheck(discovered_vm)
+    source_inventory = collect_source_disk_inventory(discovered_vm)
+    local_metadata: dict[str, Any] = {"tools": {}, "per_disk": []}
+    if discovered_vm.source == DiscoveredVM.Source.WORKSTATION:
+        local_metadata = collect_local_disk_metadata(
+            source_inventory.get("disk_paths", []),
+            timeout_seconds=int(getattr(settings, "DISK_INSPECT_TIMEOUT_SECONDS", 180)),
+        )
+        for item in local_metadata.get("per_disk", []):
+            check = item.get("qemu_img_check") if isinstance(item, dict) else None
+            if isinstance(check, dict) and check.get("ok") is False:
+                errors.append(f"qemu-img check failed for source disk {item.get('path')}")
+
+    return {
+        "checked_at": timezone.now().isoformat(),
+        "vm_name": discovered_vm.name,
+        "source": discovered_vm.source,
+        "power_state": discovered_vm.power_state,
+        "plan_output_path": plan.output_path,
+        "source_inventory": source_inventory,
+        "local_metadata": local_metadata,
+        "errors": errors,
+    }
+
+
+def _create_snapshot_if_needed(job: MigrationJob, discovered_vm: DiscoveredVM, metadata: dict[str, Any]) -> dict[str, Any]:
+    conversion = metadata.get("conversion", {}) if isinstance(metadata.get("conversion"), dict) else {}
+    existing = conversion.get("snapshot") if isinstance(conversion.get("snapshot"), dict) else {}
+    if existing.get("status") in {"created", "exists", "skipped"}:
+        return existing
+
+    if discovered_vm.source != DiscoveredVM.Source.ESXI:
+        return {
+            "status": "skipped",
+            "reason": "snapshot creation is supported only for ESXi source",
+            "created_at": timezone.now().isoformat(),
+        }
+
+    vm_meta = discovered_vm.metadata if isinstance(discovered_vm.metadata, dict) else {}
+    vm_moid = vm_meta.get("moid")
+    if not isinstance(vm_moid, str) or not vm_moid.strip():
+        raise SnapshotError("Missing VM moid in discovery metadata; cannot create ESXi snapshot.")
+
+    selected_vmware_endpoint_session_id = metadata.get("selected_vmware_endpoint_session_id")
+    if not isinstance(selected_vmware_endpoint_session_id, int):
+        raise SnapshotError("Missing selected VMware endpoint session id in job metadata.")
+    session = VmwareEndpointSession.objects.filter(id=selected_vmware_endpoint_session_id).first()
+    if session is None:
+        raise SnapshotError(f"VMware endpoint session {selected_vmware_endpoint_session_id} not found.")
+
+    snapshot_name = f"vm-migrator-job-{job.id}-{int(time.time())}"
+    created = create_vm_snapshot(
+        vmware_host=session.host,
+        vmware_username=session.username,
+        vmware_password=session.password,
+        vmware_port=session.port,
+        vmware_insecure=bool(session.insecure),
+        vm_moid=vm_moid,
+        snapshot_name=snapshot_name,
+        description=f"VM Migrator pre-migration snapshot for job {job.id}",
+        timeout_seconds=int(getattr(settings, "VMWARE_SNAPSHOT_TIMEOUT_SECONDS", 900)),
+    )
+    created["created_at"] = timezone.now().isoformat()
+    return created
+
+
+def _execute_workstation_qemu_pipeline(
+    plan: ConversionPlan,
+    vm_name: str,
+    *,
+    disk_layout_mode: str = "individual",
+    prefer_sparse_output: bool = True,
+) -> dict[str, Any]:
     """Convert workstation-exported disks with qemu-img in strict 1-to-1 mode."""
     start = time.monotonic()
     target_format = str(getattr(settings, "OPENSTACK_OUTPUT_DISK_FORMAT", "qcow2")).strip().lower() or "qcow2"
@@ -516,6 +625,13 @@ def _execute_workstation_qemu_pipeline(plan: ConversionPlan, vm_name: str) -> di
             disk_sizes[str(p)] = 0
 
     duration = round(time.monotonic() - start, 3)
+    output_paths, concat_report = _apply_disk_layout_mode(
+        paths=output_paths,
+        output_dir=output_dir,
+        vm_name=vm_name,
+        disk_layout_mode=disk_layout_mode,
+        prefer_sparse_output=prefer_sparse_output,
+    )
     output_strings = [str(p) for p in output_paths]
     return {
         "returncode": 0,
@@ -531,10 +647,18 @@ def _execute_workstation_qemu_pipeline(plan: ConversionPlan, vm_name: str) -> di
         "disk_sizes": disk_sizes,
         "disk_count": len(output_paths),
         "output_disk_format": target_format,
+        "disk_layout_mode": disk_layout_mode,
+        "concatenation": concat_report,
     }
 
 
-def _execute_virt_v2v(plan: ConversionPlan, vm_name: str) -> dict[str, Any]:
+def _execute_virt_v2v(
+    plan: ConversionPlan,
+    vm_name: str,
+    *,
+    disk_layout_mode: str = "individual",
+    prefer_sparse_output: bool = True,
+) -> dict[str, Any]:
     start = time.monotonic()
 
     run_env = os.environ.copy()
@@ -610,6 +734,13 @@ def _execute_virt_v2v(plan: ConversionPlan, vm_name: str) -> dict[str, Any]:
 
     try:
         qcow2_paths = _find_output_qcow2_paths(plan.output_path, vm_name)
+        qcow2_paths, concat_report = _apply_disk_layout_mode(
+            paths=qcow2_paths,
+            output_dir=Path(plan.output_path).expanduser().parent,
+            vm_name=vm_name,
+            disk_layout_mode=disk_layout_mode,
+            prefer_sparse_output=prefer_sparse_output,
+        )
         qcow2_paths, primary_qcow2_path, primary_disk_index, disk_analysis = _order_qcow2_paths_for_boot(qcow2_paths, vm_name)
     except ConversionExecutionError as exc:
         # Preserve virt-v2v logs even when artifact detection fails.
@@ -635,10 +766,18 @@ def _execute_virt_v2v(plan: ConversionPlan, vm_name: str) -> dict[str, Any]:
         "disk_sizes": disk_sizes,
         "disk_count": len(qcow2_paths),
         "output_disk_format": "qcow2",
+        "disk_layout_mode": disk_layout_mode,
+        "concatenation": concat_report,
     }
 
 
-def _execute_ansible_conversion(plan: ConversionPlan, vm_name: str) -> dict[str, Any]:
+def _execute_ansible_conversion(
+    plan: ConversionPlan,
+    vm_name: str,
+    *,
+    disk_layout_mode: str = "individual",
+    prefer_sparse_output: bool = True,
+) -> dict[str, Any]:
     runner = AnsibleRunner(binary=getattr(settings, "ANSIBLE_BIN", "ansible-playbook"))
     metadata_vars: dict[str, Any] = {
         "vm_name": vm_name,
@@ -663,6 +802,13 @@ def _execute_ansible_conversion(plan: ConversionPlan, vm_name: str) -> dict[str,
 
     try:
         qcow2_paths = _find_output_qcow2_paths(plan.output_path, vm_name)
+        qcow2_paths, concat_report = _apply_disk_layout_mode(
+            paths=qcow2_paths,
+            output_dir=Path(plan.output_path).expanduser().parent,
+            vm_name=vm_name,
+            disk_layout_mode=disk_layout_mode,
+            prefer_sparse_output=prefer_sparse_output,
+        )
         qcow2_paths, primary_qcow2_path, primary_disk_index, disk_analysis = _order_qcow2_paths_for_boot(qcow2_paths, vm_name)
     except ConversionExecutionError as exc:
         raise ConversionExecutionError(
@@ -692,6 +838,8 @@ def _execute_ansible_conversion(plan: ConversionPlan, vm_name: str) -> dict[str,
         "disk_count": len(qcow2_paths),
         "runner": "ansible",
         "output_disk_format": "qcow2",
+        "disk_layout_mode": disk_layout_mode,
+        "concatenation": concat_report,
     }
 
 
@@ -962,11 +1110,12 @@ def _effective_target_spec(job: MigrationJob, discovered_vm: DiscoveredVM) -> di
     requested = metadata.get("requested_spec", {}) if isinstance(metadata.get("requested_spec"), dict) else {}
     disk_layout_mode = str(requested.get("disk_layout_mode", "") or "").strip().lower()
     disk_merge = bool(requested.get("disk_merge", False))
-    if disk_merge or disk_layout_mode in {"merge", "concat", "concatenate"}:
-        raise ConversionPlanningError(
-            "Disk concatenation/merge is forbidden in production mode. "
-            "Disk architecture must remain unchanged (1-to-1, same order, no merge)."
-        )
+    if disk_merge and not disk_layout_mode:
+        disk_layout_mode = "concat"
+    if disk_layout_mode in {"merge", "concatenate"}:
+        disk_layout_mode = "concat"
+    if disk_layout_mode not in {"individual", "concat"}:
+        disk_layout_mode = "individual"
 
     flavor_id = requested.get("flavor_id") if isinstance(requested.get("flavor_id"), str) else None
     if isinstance(flavor_id, str) and not flavor_id.strip():
@@ -1006,6 +1155,7 @@ def _effective_target_spec(job: MigrationJob, discovered_vm: DiscoveredVM) -> di
         "flavor_id": flavor_id,
         "cpu": target_cpu,
         "ram": target_ram,
+        "disk_layout_mode": disk_layout_mode,
         "network_id": network_id,
         "network_name": network_name,
         "fixed_ip": fixed_ip,
@@ -1041,6 +1191,97 @@ def _validate_openstack_disk_attachments(conn, server_id: str, expected_volume_i
             "requires in-guest agent checks."
         ),
     }
+
+
+def _validate_openstack_post_migration(
+    conn,
+    *,
+    image_ids: list[str],
+    server_id: str,
+    expected_flavor_id: str,
+    expected_cpu: int | None,
+    expected_ram: int | None,
+    expected_disk_sizes: dict[str, int] | None,
+    expected_network_id: str | None,
+    volume_ids: list[str],
+) -> dict[str, Any]:
+    image_checks: list[dict[str, Any]] = []
+    for image_id in image_ids:
+        image = conn.image.get_image(image_id)
+        status = str(getattr(image, "status", "")).lower()
+        size = int(getattr(image, "size", 0) or 0)
+        virtual_size = int(getattr(image, "virtual_size", 0) or 0)
+        image_checks.append(
+            {
+                "image_id": image_id,
+                "status": status,
+                "size": size,
+                "virtual_size": virtual_size,
+                "ok": status == "active" and (size > 0 or virtual_size > 0),
+            }
+        )
+
+    server = conn.compute.get_server(server_id)
+    server_status = str(getattr(server, "status", "")).upper()
+    server_flavor = getattr(server, "flavor", {}) or {}
+    server_flavor_id = str(server_flavor.get("id", ""))
+    flavor = conn.compute.get_flavor(expected_flavor_id)
+    server_addresses = getattr(server, "addresses", {}) or {}
+
+    volume_checks: list[dict[str, Any]] = []
+    for volume_id in volume_ids:
+        volume = conn.block_storage.get_volume(volume_id)
+        vol_size_gb = int(getattr(volume, "size", 0) or 0)
+        volume_checks.append(
+            {
+                "volume_id": volume_id,
+                "status": str(getattr(volume, "status", "")).lower(),
+                "size_gb": vol_size_gb,
+                "ok": vol_size_gb >= 1,
+            }
+        )
+
+    disk_expected_count = len(expected_disk_sizes or {})
+    network_ok = bool(server_addresses)
+    if expected_network_id:
+        network_ok = any(
+            str(getattr(net_item, "id", "")) == str(expected_network_id)
+            for net_item in conn.network.networks()
+        ) and network_ok
+
+    checks = {
+        "images": image_checks,
+        "server": {
+            "status": server_status,
+            "flavor_id": server_flavor_id,
+            "expected_flavor_id": expected_flavor_id,
+            "expected_cpu": expected_cpu,
+            "expected_ram": expected_ram,
+            "actual_cpu": int(getattr(flavor, "vcpus", 0) or 0),
+            "actual_ram": int(getattr(flavor, "ram", 0) or 0),
+            "addresses": server_addresses,
+            "network_ok": network_ok,
+            "ok": (
+                server_status == "ACTIVE"
+                and server_flavor_id == str(expected_flavor_id)
+                and (expected_cpu is None or int(getattr(flavor, "vcpus", 0) or 0) >= int(expected_cpu))
+                and (expected_ram is None or int(getattr(flavor, "ram", 0) or 0) >= int(expected_ram))
+                and network_ok
+            ),
+        },
+        "volumes": {
+            "items": volume_checks,
+            "expected_count": max(disk_expected_count, len(volume_ids)),
+            "actual_count": len(volume_ids),
+            "ok": all(item["ok"] for item in volume_checks),
+        },
+    }
+    checks["ok"] = (
+        all(item["ok"] for item in image_checks)
+        and checks["server"]["ok"]
+        and checks["volumes"]["ok"]
+    )
+    return checks
 
 
 def _run_openstack_deployment(job: MigrationJob, discovered_vm: DiscoveredVM) -> dict[str, Any]:
@@ -1288,6 +1529,21 @@ def _run_openstack_deployment(job: MigrationJob, discovered_vm: DiscoveredVM) ->
             f"{attachment_validation.get('missing_or_not_in_use')}"
         )
 
+    post_validation = _validate_openstack_post_migration(
+        conn,
+        image_ids=image_ids,
+        server_id=server_id,
+        expected_flavor_id=flavor.id,
+        expected_cpu=target_spec.get("cpu"),
+        expected_ram=target_spec.get("ram"),
+        expected_disk_sizes=execution.get("disk_sizes") if isinstance(execution.get("disk_sizes"), dict) else {},
+        expected_network_id=getattr(network, "id", None),
+        volume_ids=converted_volume_ids + extra_volume_ids,
+    )
+    os_meta["post_validation"] = post_validation
+    if not post_validation.get("ok"):
+        raise OpenStackDeploymentError(f"Post-migration validation failed: {post_validation}")
+
     if job.status == MigrationJob.Status.DEPLOYED and job.can_transition_to(MigrationJob.Status.VERIFIED):
         job.transition(MigrationJob.Status.VERIFIED)
 
@@ -1311,6 +1567,7 @@ def _run_openstack_deployment(job: MigrationJob, discovered_vm: DiscoveredVM) ->
 def start_migration(job_id: int) -> dict[str, Any]:
     """Migration starter with conversion and optional OpenStack deployment."""
 
+    job: MigrationJob | None = None
     try:
         try:
             job = MigrationJob.objects.get(id=job_id)
@@ -1331,38 +1588,35 @@ def start_migration(job_id: int) -> dict[str, Any]:
             if job.status == MigrationJob.Status.PENDING:
                 job.transition(MigrationJob.Status.DISCOVERED)
             if job.status == MigrationJob.Status.DISCOVERED:
-                job.transition(MigrationJob.Status.CONVERTING)
+                job.transition(MigrationJob.Status.PRECHECK)
 
         job.refresh_from_db()
 
-        # Conversion stage (may take minutes): no DB transaction should be held open here.
-        if job.status == MigrationJob.Status.CONVERTING:
+        if job.status in {
+            MigrationJob.Status.PRECHECK,
+            MigrationJob.Status.SNAPSHOT_CREATED,
+            MigrationJob.Status.DISK_ANALYZING,
+            MigrationJob.Status.CONVERTING,
+            MigrationJob.Status.BLOCK_VALIDATING,
+        }:
             discovered_vm = _find_discovered_vm_for_job(job)
+        metadata = job.conversion_metadata if isinstance(job.conversion_metadata, dict) else {}
+
+        def _build_plan_with_context() -> tuple[ConversionPlan, dict[str, Any], Path | None]:
             esxi_uri = None
             passfile: Path | None = None
+            validation: dict[str, Any] = {"checked_paths": [], "errors": [], "skipped": False}
 
             if discovered_vm.source == DiscoveredVM.Source.ESXI:
-                # For safety: require powered off in ESXi conversions.
                 if (discovered_vm.power_state or "").lower() not in {"poweredoff", "powered_off", "poweroff", "off"}:
                     raise ConversionPlanningError(
                         f"ESXi VM '{discovered_vm.name}' must be powered off for safe conversion "
                         f"(current power_state='{discovered_vm.power_state}')."
                     )
-
-                # Minimal snapshot guardrail: refuse to proceed if VM has snapshots (default).
-                require_no_snaps = bool(getattr(settings, "VMWARE_REQUIRE_NO_SNAPSHOTS", True))
-                has_snaps = bool((discovered_vm.metadata or {}).get("has_snapshots"))
-                if require_no_snaps and has_snaps:
-                    raise ConversionPlanningError(
-                        f"ESXi VM '{discovered_vm.name}' has snapshots; consolidate/remove snapshots before conversion."
-                    )
-
-                metadata = job.conversion_metadata if isinstance(job.conversion_metadata, dict) else {}
                 vmware_endpoint_session_id = metadata.get("selected_vmware_endpoint_session_id")
                 vmware_session = None
                 if isinstance(vmware_endpoint_session_id, int):
                     vmware_session = VmwareEndpointSession.objects.filter(id=vmware_endpoint_session_id).first()
-
                 esxi_password = (
                     vmware_session.password.strip()
                     if vmware_session and isinstance(vmware_session.password, str)
@@ -1370,8 +1624,6 @@ def start_migration(job_id: int) -> dict[str, Any]:
                 )
                 if not esxi_password:
                     raise ConversionPlanningError("VMWARE_ESXI_PASSWORD is required for ESXi conversion.")
-
-                # Create a per-job temp dir for secret files; rollback cleans it.
                 temp_dir = Path(settings.MIGRATION_OUTPUT_DIR) / "tmp" / f"job-{job.id}"
                 passfile = _write_password_file(temp_dir, esxi_password)
                 if vmware_session:
@@ -1382,6 +1634,7 @@ def start_migration(job_id: int) -> dict[str, Any]:
                     )
                 else:
                     esxi_uri = _build_esxi_libvirt_uri()
+                validation["checked_paths"] = [{"password_file": str(passfile), "esxi_uri": esxi_uri}]
 
             plan = plan_vmware_conversion(
                 discovered_vm,
@@ -1392,25 +1645,95 @@ def start_migration(job_id: int) -> dict[str, Any]:
                 vddk_libdir=os.getenv("VMWARE_VDDK_LIBDIR", "").strip() or None,
                 vddk_thumbprint=os.getenv("VMWARE_VDDK_THUMBPRINT", "").strip() or None,
             )
-
-            validation: dict[str, Any] = {"checked_paths": [], "errors": [], "skipped": False}
             if discovered_vm.source == DiscoveredVM.Source.WORKSTATION:
                 validation = _validate_workstation_paths(plan.input_disks, plan.output_path)
                 if validation["errors"]:
                     raise ConversionPlanningError("; ".join(validation["errors"]))
-            elif discovered_vm.source == DiscoveredVM.Source.ESXI:
-                validation["checked_paths"] = [
-                    {"password_file": str(passfile) if passfile else None, "esxi_uri": esxi_uri}
-                ]
-            else:
-                raise ConversionPlanningError(f"Unsupported VMware source '{discovered_vm.source}'.")
+            return plan, validation, passfile
 
+        if job.status == MigrationJob.Status.PRECHECK:
+            plan, validation, _ = _build_plan_with_context()
+            precheck = _build_precheck_report(discovered_vm, plan)
+            if precheck.get("errors"):
+                raise ConversionPlanningError("; ".join(precheck["errors"]))
+
+            real_conversion_enabled = bool(getattr(settings, "ENABLE_REAL_CONVERSION", False))
+            mode = "real" if real_conversion_enabled else "dry-run"
+            metadata.update(
+                _build_base_conversion_metadata(
+                    discovered_vm=discovered_vm,
+                    plan=plan,
+                    validation=validation,
+                    mode=mode,
+                )
+            )
+            metadata["conversion"]["precheck"] = precheck
+            metadata["conversion"]["phase"] = MigrationJob.Status.PRECHECK
+            job.conversion_metadata = metadata
+            job.save(update_fields=["conversion_metadata", "updated_at"])
+            logger.info(
+                "migration.precheck.completed",
+                extra={"job_id": job.id, "vm_name": job.vm_name, "disk_count": precheck["source_inventory"]["disk_count"]},
+            )
+            if job.can_transition_to(MigrationJob.Status.SNAPSHOT_CREATED):
+                job.transition(MigrationJob.Status.SNAPSHOT_CREATED)
+            job.refresh_from_db()
+
+        if job.status == MigrationJob.Status.SNAPSHOT_CREATED:
+            snapshot = _create_snapshot_if_needed(job, discovered_vm, metadata)
+            conversion = metadata.get("conversion", {}) if isinstance(metadata.get("conversion"), dict) else {}
+            conversion["snapshot"] = snapshot
+            conversion["phase"] = MigrationJob.Status.SNAPSHOT_CREATED
+            metadata["conversion"] = conversion
+            job.conversion_metadata = metadata
+            job.save(update_fields=["conversion_metadata", "updated_at"])
+            logger.info(
+                "migration.snapshot.created",
+                extra={"job_id": job.id, "vm_name": job.vm_name, "snapshot": snapshot},
+            )
+            if job.can_transition_to(MigrationJob.Status.DISK_ANALYZING):
+                job.transition(MigrationJob.Status.DISK_ANALYZING)
+            job.refresh_from_db()
+
+        target_spec = _effective_target_spec(job, discovered_vm)
+        if job.status == MigrationJob.Status.DISK_ANALYZING:
+            conversion = metadata.get("conversion", {}) if isinstance(metadata.get("conversion"), dict) else {}
+            precheck_local = (
+                conversion.get("precheck", {}).get("local_metadata")
+                if isinstance(conversion.get("precheck"), dict)
+                else {}
+            )
+            sparse_candidate = infer_sparse_candidate(precheck_local if isinstance(precheck_local, dict) else {})
+            conversion["disk_analysis_stage"] = {
+                "checked_at": timezone.now().isoformat(),
+                "disk_layout_mode": target_spec["disk_layout_mode"],
+                "source_inventory": collect_source_disk_inventory(discovered_vm),
+                "prefer_sparse_output": sparse_candidate,
+            }
+            conversion["phase"] = MigrationJob.Status.DISK_ANALYZING
+            metadata["conversion"] = conversion
+            job.conversion_metadata = metadata
+            job.save(update_fields=["conversion_metadata", "updated_at"])
+            logger.info(
+                "migration.disk.inspect",
+                extra={
+                    "job_id": job.id,
+                    "vm_name": job.vm_name,
+                    "disk_layout_mode": target_spec["disk_layout_mode"],
+                    "prefer_sparse_output": sparse_candidate,
+                },
+            )
+            if job.can_transition_to(MigrationJob.Status.CONVERTING):
+                job.transition(MigrationJob.Status.CONVERTING)
+            job.refresh_from_db()
+
+        if job.status == MigrationJob.Status.CONVERTING:
+            plan, validation, passfile = _build_plan_with_context()
             real_conversion_enabled = bool(getattr(settings, "ENABLE_REAL_CONVERSION", False))
             mode = "real" if real_conversion_enabled else "dry-run"
             if real_conversion_enabled:
                 _ensure_libguestfs_kernel_readable()
 
-            metadata = job.conversion_metadata if isinstance(job.conversion_metadata, dict) else {}
             previous_execution: dict[str, Any] = {}
             if isinstance(metadata.get("conversion"), dict) and isinstance(metadata["conversion"].get("execution"), dict):
                 previous_execution = metadata["conversion"]["execution"]
@@ -1423,9 +1746,7 @@ def start_migration(job_id: int) -> dict[str, Any]:
                     mode=mode,
                 )
             )
-
-            # Track temp dirs so rollback can clean them.
-            if discovered_vm.source == DiscoveredVM.Source.ESXI:
+            if discovered_vm.source == DiscoveredVM.Source.ESXI and passfile is not None:
                 temp_dirs = metadata.get("conversion", {}).get("temp_dirs")
                 if not isinstance(temp_dirs, list):
                     temp_dirs = []
@@ -1434,20 +1755,19 @@ def start_migration(job_id: int) -> dict[str, Any]:
                     temp_dirs.append(temp_dir_str)
                 metadata["conversion"]["temp_dirs"] = temp_dirs
 
-            # Preserve earlier execution metadata if present.
             if previous_execution:
                 metadata["conversion"]["execution"] = previous_execution
-
+            already_converted = False
             prior = metadata.get("conversion", {}).get("execution", {})
             if prior.get("state") == "succeeded" and prior.get("output_qcow2_path"):
                 out = Path(prior["output_qcow2_path"])
                 if out.exists() and out.is_file():
-                    with transaction.atomic():
-                        job = MigrationJob.objects.select_for_update().get(id=job_id)
-                        if job.status == MigrationJob.Status.CONVERTING and job.can_transition_to(MigrationJob.Status.UPLOADING):
-                            job.transition(MigrationJob.Status.UPLOADING)
-                        job.conversion_metadata = metadata
-                        job.save(update_fields=["status", "conversion_metadata", "updated_at"])
+                    already_converted = True
+                    if job.can_transition_to(MigrationJob.Status.BLOCK_VALIDATING):
+                        job.transition(MigrationJob.Status.BLOCK_VALIDATING)
+                    job.conversion_metadata = metadata
+                    job.save(update_fields=["status", "conversion_metadata", "updated_at"])
+                    job.refresh_from_db()
                 else:
                     previous_execution = {}
 
@@ -1475,54 +1795,54 @@ def start_migration(job_id: int) -> dict[str, Any]:
                     "dry_run": True,
                 }
 
-            # Concurrency guard: only one worker should run conversion for a given job at a time.
-            # We do a short "compare-and-set" under a row lock, then release it before running virt-v2v.
-            with transaction.atomic():
-                job = MigrationJob.objects.select_for_update().get(id=job_id)
-                db_meta = job.conversion_metadata if isinstance(job.conversion_metadata, dict) else {}
-                db_conv = db_meta.get("conversion", {}) if isinstance(db_meta.get("conversion"), dict) else {}
-                db_exec = db_conv.get("execution", {}) if isinstance(db_conv.get("execution"), dict) else {}
-                if db_exec.get("state") == "running":
-                    logger.info(
-                        "migration.start conversion_already_running",
-                        extra={"job_id": job.id, "vm_name": job.vm_name},
+            if not already_converted:
+                with transaction.atomic():
+                    job = MigrationJob.objects.select_for_update().get(id=job_id)
+                    db_meta = job.conversion_metadata if isinstance(job.conversion_metadata, dict) else {}
+                    db_conv = db_meta.get("conversion", {}) if isinstance(db_meta.get("conversion"), dict) else {}
+                    db_exec = db_conv.get("execution", {}) if isinstance(db_conv.get("execution"), dict) else {}
+                    if db_exec.get("state") == "running":
+                        logger.info(
+                            "migration.start conversion_already_running",
+                            extra={"job_id": job.id, "vm_name": job.vm_name},
+                        )
+                        return {"job_id": job.id, "result": "already_running", "status": job.status}
+                    metadata["conversion"]["execution"] = {"state": "running", "started_at": timezone.now().isoformat()}
+                    job.conversion_metadata = metadata
+                    job.save(update_fields=["conversion_metadata", "updated_at"])
+
+                precheck_local = metadata.get("conversion", {}).get("precheck", {}).get("local_metadata", {})
+                prefer_sparse_output = infer_sparse_candidate(precheck_local if isinstance(precheck_local, dict) else {})
+                if discovered_vm.source == DiscoveredVM.Source.WORKSTATION:
+                    exec_result = _execute_workstation_qemu_pipeline(
+                        plan,
+                        discovered_vm.name,
+                        disk_layout_mode=target_spec["disk_layout_mode"],
+                        prefer_sparse_output=prefer_sparse_output,
                     )
-                    return {
-                        "job_id": job.id,
-                        "result": "already_running",
-                        "status": job.status,
-                    }
+                elif bool(getattr(settings, "ENABLE_ANSIBLE_CONVERSION", False)):
+                    exec_result = _execute_ansible_conversion(
+                        plan,
+                        discovered_vm.name,
+                        disk_layout_mode=target_spec["disk_layout_mode"],
+                        prefer_sparse_output=prefer_sparse_output,
+                    )
+                else:
+                    exec_result = _execute_virt_v2v(
+                        plan,
+                        discovered_vm.name,
+                        disk_layout_mode=target_spec["disk_layout_mode"],
+                        prefer_sparse_output=prefer_sparse_output,
+                    )
+                metadata["conversion"]["execution"] = {"state": "succeeded", **exec_result}
 
-                metadata["conversion"]["execution"] = {
-                    "state": "running",
-                    "started_at": timezone.now().isoformat(),
-                }
-                job.conversion_metadata = metadata
-                job.save(update_fields=["conversion_metadata", "updated_at"])
-
-            if discovered_vm.source == DiscoveredVM.Source.WORKSTATION:
-                exec_result = _execute_workstation_qemu_pipeline(plan, discovered_vm.name)
-            elif bool(getattr(settings, "ENABLE_ANSIBLE_CONVERSION", False)):
-                exec_result = _execute_ansible_conversion(plan, discovered_vm.name)
-            else:
-                exec_result = _execute_virt_v2v(plan, discovered_vm.name)
-            metadata["conversion"]["execution"] = {
-                "state": "succeeded",
-                **exec_result,
-            }
-
-            # Optional minimal artifact backup: keep a copy of the QCOW2 before OpenStack upload.
-            if bool(getattr(settings, "ENABLE_ARTIFACT_BACKUP", False)):
+            if bool(getattr(settings, "ENABLE_ARTIFACT_BACKUP", False)) and not already_converted:
                 try:
                     src_paths = exec_result.get("output_qcow2_paths")
                     if not isinstance(src_paths, list) or not src_paths:
                         src_paths = [exec_result["output_qcow2_path"]]
                     backup_root = Path(
-                        getattr(
-                            settings,
-                            "ARTIFACT_BACKUP_DIR",
-                            str(Path(settings.MIGRATION_OUTPUT_DIR) / "backups"),
-                        )
+                        getattr(settings, "ARTIFACT_BACKUP_DIR", str(Path(settings.MIGRATION_OUTPUT_DIR) / "backups"))
                     ).expanduser()
                     backup_dir = backup_root / f"job-{job.id}"
                     backup_dir.mkdir(parents=True, exist_ok=True)
@@ -1552,20 +1872,66 @@ def start_migration(job_id: int) -> dict[str, Any]:
             with transaction.atomic():
                 job = MigrationJob.objects.select_for_update().get(id=job_id)
                 job.conversion_metadata = metadata
-                if job.status == MigrationJob.Status.CONVERTING and job.can_transition_to(MigrationJob.Status.UPLOADING):
-                    job.transition(MigrationJob.Status.UPLOADING)
+                if job.status == MigrationJob.Status.CONVERTING and job.can_transition_to(MigrationJob.Status.BLOCK_VALIDATING):
+                    job.transition(MigrationJob.Status.BLOCK_VALIDATING)
                 job.save(update_fields=["status", "conversion_metadata", "updated_at"])
-
+            execution_meta = metadata.get("conversion", {}).get("execution", {})
             logger.info(
                 "migration.start conversion_success",
                 extra={
                     "job_id": job.id,
                     "vm_name": job.vm_name,
                     "command": plan.command,
-                    "output_qcow2_path": exec_result["output_qcow2_path"],
+                    "output_qcow2_path": execution_meta.get("output_qcow2_path"),
+                    "disk_layout_mode": execution_meta.get("disk_layout_mode"),
+                    "reused_existing_artifact": already_converted,
                 },
             )
+            job.refresh_from_db()
 
+        if job.status == MigrationJob.Status.BLOCK_VALIDATING:
+            conversion = metadata.get("conversion", {}) if isinstance(metadata.get("conversion"), dict) else {}
+            execution = conversion.get("execution", {}) if isinstance(conversion.get("execution"), dict) else {}
+            output_paths = execution.get("output_qcow2_paths")
+            if not isinstance(output_paths, list) or not output_paths:
+                single = execution.get("output_qcow2_path")
+                output_paths = [single] if isinstance(single, str) and single.strip() else []
+            if not output_paths:
+                raise ConversionExecutionError("Missing conversion output paths for block validation.")
+
+            block_report = validate_qcow2_images(
+                [str(p) for p in output_paths],
+                timeout_seconds=int(getattr(settings, "QEMU_IMG_TIMEOUT_SECONDS", 600)),
+            )
+            conversion["block_validation"] = block_report
+            logger.info("migration.block.validation", extra={"job_id": job.id, "vm_name": job.vm_name, "report": block_report})
+            if not block_report.get("ok"):
+                raise ConversionExecutionError(f"Block validation failed for converted images: {block_report.get('failed')}")
+
+            filesystem_report = run_filesystem_consistency_check(
+                [str(p) for p in output_paths],
+                timeout_seconds=int(getattr(settings, "DISK_INSPECT_TIMEOUT_SECONDS", 300)),
+            )
+            conversion["filesystem_validation"] = filesystem_report
+            precheck_per_disk = conversion.get("precheck", {}).get("local_metadata", {}).get("per_disk", [])
+            first_precheck = precheck_per_disk[0] if isinstance(precheck_per_disk, list) and precheck_per_disk else {}
+            target_checks = filesystem_report.get("checks", [])
+            first_target = target_checks[0] if isinstance(target_checks, list) and target_checks else {}
+            precheck_layout = first_precheck.get("partition_layout", {}).get("stdout", "") if isinstance(first_precheck, dict) else ""
+            target_layout = first_target.get("partition_layout", {}).get("stdout", "") if isinstance(first_target, dict) else ""
+            conversion["partition_layout_compare"] = compare_partition_layout(
+                str(precheck_layout or ""),
+                str(target_layout or ""),
+            )
+            if not filesystem_report.get("ok"):
+                raise ConversionExecutionError("Filesystem consistency checks failed after conversion.")
+
+            conversion["phase"] = MigrationJob.Status.BLOCK_VALIDATING
+            metadata["conversion"] = conversion
+            job.conversion_metadata = metadata
+            if job.can_transition_to(MigrationJob.Status.UPLOADING):
+                job.transition(MigrationJob.Status.UPLOADING)
+            job.save(update_fields=["status", "conversion_metadata", "updated_at"])
             job.refresh_from_db()
 
         if job.status == MigrationJob.Status.UPLOADING and not discovered_vm:
@@ -1603,6 +1969,8 @@ def start_migration(job_id: int) -> dict[str, Any]:
         }
 
     except ConversionExecutionError as exc:
+        if job is None:
+            raise
         metadata = job.conversion_metadata if isinstance(job.conversion_metadata, dict) else {}
         conv = metadata.get("conversion", {}) if isinstance(metadata.get("conversion"), dict) else {}
         conv["execution"] = {
@@ -1633,11 +2001,17 @@ def start_migration(job_id: int) -> dict[str, Any]:
         OpenStackDeploymentError,
         ConversionPlanningError,
         AnsibleRunnerError,
+        DiskInspectionError,
+        BlockValidationError,
+        FilesystemCheckError,
+        SnapshotError,
         InvalidTransitionError,
         PermissionError,
         OSError,
         subprocess.SubprocessError,
     ) as exc:
+        if job is None:
+            raise
         error_message = str(exc)
         _mark_job_failed(job, error_message)
         _schedule_rollback(job, error_message)
@@ -1652,6 +2026,8 @@ def start_migration(job_id: int) -> dict[str, Any]:
             "error": error_message,
         }
     except Exception as exc:
+        if job is None:
+            raise
         error_message = f"unexpected error: {exc}"
         _mark_job_failed(job, error_message)
         _schedule_rollback(job, error_message)

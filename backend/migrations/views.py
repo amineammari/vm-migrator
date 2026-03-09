@@ -376,7 +376,11 @@ def create_migrations_from_vmware(request):
     active_statuses = [
         MigrationJob.Status.PENDING,
         MigrationJob.Status.DISCOVERED,
+        MigrationJob.Status.PRECHECK,
+        MigrationJob.Status.SNAPSHOT_CREATED,
+        MigrationJob.Status.DISK_ANALYZING,
         MigrationJob.Status.CONVERTING,
+        MigrationJob.Status.BLOCK_VALIDATING,
         MigrationJob.Status.UPLOADING,
         MigrationJob.Status.DEPLOYED,
     ]

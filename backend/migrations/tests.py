@@ -46,8 +46,8 @@ class DiskFormatDetectionTests(SimpleTestCase):
 
 
 class QemuImgWrapperTests(SimpleTestCase):
-    @patch("backend.migrations.disk_formats.shutil.which")
-    @patch("backend.migrations.disk_formats.subprocess.run")
+    @patch("migrations.disk_formats.shutil.which")
+    @patch("migrations.disk_formats.subprocess.run")
     def test_convert_with_qemu_img_success(self, run_mock, which_mock):
         which_mock.return_value = "/usr/bin/qemu-img"
         run_mock.return_value = SimpleNamespace(returncode=0, stdout="", stderr="")
@@ -65,8 +65,8 @@ class QemuImgWrapperTests(SimpleTestCase):
             self.assertEqual(result["target_format"], "qcow2")
             self.assertIn("qemu-img convert", result["command"])
 
-    @patch("backend.migrations.disk_formats.shutil.which")
-    @patch("backend.migrations.disk_formats.subprocess.run")
+    @patch("migrations.disk_formats.shutil.which")
+    @patch("migrations.disk_formats.subprocess.run")
     def test_convert_with_qemu_img_failure(self, run_mock, which_mock):
         which_mock.return_value = "/usr/bin/qemu-img"
         run_mock.return_value = SimpleNamespace(returncode=1, stdout="x", stderr="boom")
@@ -84,13 +84,12 @@ class QemuImgWrapperTests(SimpleTestCase):
 
 
 class DiskPolicySerializerTests(SimpleTestCase):
-    def test_block_disk_merge_flag(self):
+    def test_map_disk_merge_flag_to_concat_mode(self):
         serializer = VMOverridesSerializer(data={"disk_merge": True})
-        self.assertFalse(serializer.is_valid())
-        self.assertIn("Disk concatenation/merge is not allowed", str(serializer.errors))
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        self.assertEqual(serializer.validated_data.get("disk_layout_mode"), "concat")
 
-    def test_block_disk_concat_mode(self):
+    def test_accept_disk_concat_mode(self):
         serializer = VMOverridesSerializer(data={"disk_layout_mode": "concat"})
-        self.assertFalse(serializer.is_valid())
-        self.assertIn("Disk concatenation/merge is not allowed", str(serializer.errors))
-
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        self.assertEqual(serializer.validated_data.get("disk_layout_mode"), "concat")

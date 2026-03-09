@@ -10,7 +10,11 @@ class MigrationJob(models.Model):
     class Status(models.TextChoices):
         PENDING = "PENDING", "Pending"
         DISCOVERED = "DISCOVERED", "Discovered"
+        PRECHECK = "PRECHECK", "Precheck"
+        SNAPSHOT_CREATED = "SNAPSHOT_CREATED", "Snapshot Created"
+        DISK_ANALYZING = "DISK_ANALYZING", "Disk Analyzing"
         CONVERTING = "CONVERTING", "Converting"
+        BLOCK_VALIDATING = "BLOCK_VALIDATING", "Block Validating"
         UPLOADING = "UPLOADING", "Uploading"
         DEPLOYED = "DEPLOYED", "Deployed"
         VERIFIED = "VERIFIED", "Verified"
@@ -19,8 +23,12 @@ class MigrationJob(models.Model):
 
     TRANSITIONS = {
         Status.PENDING: {Status.DISCOVERED, Status.FAILED},
-        Status.DISCOVERED: {Status.CONVERTING, Status.FAILED},
-        Status.CONVERTING: {Status.UPLOADING, Status.FAILED},
+        Status.DISCOVERED: {Status.PRECHECK, Status.CONVERTING, Status.FAILED},
+        Status.PRECHECK: {Status.SNAPSHOT_CREATED, Status.FAILED},
+        Status.SNAPSHOT_CREATED: {Status.DISK_ANALYZING, Status.FAILED},
+        Status.DISK_ANALYZING: {Status.CONVERTING, Status.FAILED},
+        Status.CONVERTING: {Status.BLOCK_VALIDATING, Status.UPLOADING, Status.FAILED},
+        Status.BLOCK_VALIDATING: {Status.UPLOADING, Status.FAILED},
         Status.UPLOADING: {Status.DEPLOYED, Status.FAILED},
         Status.DEPLOYED: {Status.VERIFIED, Status.ROLLED_BACK, Status.FAILED},
         Status.VERIFIED: set(),

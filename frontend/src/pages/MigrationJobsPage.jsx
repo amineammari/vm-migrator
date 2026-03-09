@@ -68,7 +68,7 @@ function MigrationJobsPage() {
   const jobStats = useMemo(() => {
     const total = jobs.length
     const active = jobs.filter((job) =>
-      ['PENDING', 'DISCOVERED', 'CONVERTING', 'UPLOADING', 'DEPLOYED'].includes(job.status),
+      ['PENDING', 'DISCOVERED', 'PRECHECK', 'SNAPSHOT_CREATED', 'DISK_ANALYZING', 'CONVERTING', 'BLOCK_VALIDATING', 'UPLOADING', 'DEPLOYED'].includes(job.status),
     ).length
     const failed = jobs.filter((job) => ['FAILED', 'ROLLED_BACK'].includes(job.status)).length
     const verified = jobs.filter((job) => job.status === 'VERIFIED').length
