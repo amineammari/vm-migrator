@@ -1,10 +1,22 @@
 # VM Migrator
 
-VM Migrator is a Django + Celery orchestration platform for migrating virtual machines from VMware (Workstation/ESXi via `pyVmomi`) to OpenStack (via `openstacksdk`) with validation-first execution, integrity checks, structured observability, and rollback safety.
+VM Migrator is a Django + Celery orchestration platform that migrates virtual machines from VMware (Workstation/ESXi) to OpenStack with validation, integrity checks, and rollback automation.
 
-## Architecture Overview
+This README is written for:
+- Production operations teams deploying and running the platform.
+- Support/maintenance teams triaging incidents and troubleshooting migration jobs.
 
-### System Context
+## What This Project Does
+
+- Discovers VMware VMs and persists inventory (`DiscoveredVM`).
+- Creates migration jobs (`MigrationJob`) from selected VMs.
+- Executes migration asynchronously through Celery workers.
+- Converts disks using host tools (`virt-v2v`, `qemu-img`, `libguestfs` utilities).
+- Uploads artifacts to OpenStack and validates deployed resources.
+- Triggers rollback/cleanup on failure when enabled.
+
+## Architecture
+
 ```mermaid
 flowchart LR
   UI[React Frontend\nVite SPA] -->|REST /api| API[Django API\nDRF]
@@ -20,218 +32,81 @@ flowchart LR
   WORKER -.optional.-> ANS[Ansible Runner]
 ```
 
-### Runtime Flow
-```mermaid
-sequenceDiagram
-  participant FE as Frontend
-  participant API as Django API
-  participant Q as Redis/Celery
-  participant W as Celery Worker
-  participant VM as VMware
-  participant OS as OpenStack
+## Migration Lifecycle
 
-  FE->>API: Create migration job
-  API->>Q: start_migration.delay(job_id)
-  Q->>W: Execute pipeline
+### Job states
 
-  W->>VM: Precheck + inventory validation
-  W->>VM: Create snapshot (ESXi)
-  W->>W: Disk analysis (layout/fs/used-space)
-  W->>W: Conversion (individual or concat policy)
-  W->>W: qemu-img check + filesystem consistency checks
-  W->>OS: Upload image(s), create volume(s), boot Nova instance
-  W->>OS: Post-deploy validation (image/server/volumes/network)
-  W->>API: Persist state + metadata + logs
+`PENDING -> DISCOVERED -> PRECHECK -> SNAPSHOT_CREATED -> DISK_ANALYZING -> CONVERTING -> BLOCK_VALIDATING -> UPLOADING -> DEPLOYED -> VERIFIED`
 
-  Note over W: On any failure: mark FAILED and trigger rollback task
-```
+Failure path:
 
-## Components And Roles
+`<any active state> -> FAILED -> ROLLED_BACK`
 
-### Frontend (`frontend/`)
-- Migration dashboard and job drill-down views.
-- VMware/OpenStack endpoint onboarding UX.
-- Polling and status rendering for migration lifecycle states.
+### Pipeline summary
 
-### Backend API (`backend/core`, `backend/migrations/views.py`)
-- Exposes REST endpoints for discovery, job creation, job status, and manual rollback.
-- Validates user requests and persists normalized migration intent.
-- Triggers Celery tasks and returns async-facing payloads.
+1. Discovery reads VMware inventory and stores VM metadata.
+2. Precheck validates source disk/datastore and migration prerequisites.
+3. Snapshot is created for ESXi jobs (when applicable).
+4. Disk strategy is selected (`individual` or `concat`).
+5. Conversion runs and artifacts are block/filesystem validated.
+6. OpenStack image/volume/server resources are created and verified.
+7. Failures trigger rollback cleanup if rollback is enabled.
 
-### Migration Domain (`backend/migrations/`)
-- `models.py`: persistent entities and state machine rules.
-- `tasks.py`: orchestration pipeline, retries, rollback scheduling, idempotency guards.
-- `vmware_client.py`: VMware read-only discovery via `pyVmomi`.
-- `openstack_deployment.py`: OpenStack resource lifecycle helpers.
-- `conversion.py`: conversion planning for `virt-v2v` / per-disk conversion strategy.
-- `disk_formats.py`: source format detection and `qemu-img convert` wrappers.
-- `disk_inspection.py`: precheck disk metadata, datastore/disk validation, concat helper.
-- `snapshot_manager.py`: ESXi snapshot creation for rollback safety.
-- `block_validation.py`: block-level post-conversion checks via `qemu-img check`.
-- `filesystem_check.py`: filesystem/partition consistency checks (`virt-filesystems`, `guestfish`, `fsck`).
+## Repository Layout
 
-### Celery + Redis
-- Redis is broker + result backend.
-- Celery workers execute heavy/long-running operations outside API request threads.
-- Supports resilient, asynchronous orchestration with state persistence.
-
-### External Systems
-- VMware source of truth for VM config/disks/snapshot operations.
-- OpenStack target platform for image upload, volume creation, and Nova deployment.
-- Host virtualization tools provide conversion and integrity/consistency checks.
-
-## Migration State Machine
-
-```mermaid
-stateDiagram-v2
-  [*] --> PENDING
-  PENDING --> DISCOVERED
-  DISCOVERED --> PRECHECK
-  PRECHECK --> SNAPSHOT_CREATED
-  SNAPSHOT_CREATED --> DISK_ANALYZING
-  DISK_ANALYZING --> CONVERTING
-  CONVERTING --> BLOCK_VALIDATING
-  BLOCK_VALIDATING --> UPLOADING
-  UPLOADING --> DEPLOYED
-  DEPLOYED --> VERIFIED
-
-  PENDING --> FAILED
-  DISCOVERED --> FAILED
-  PRECHECK --> FAILED
-  SNAPSHOT_CREATED --> FAILED
-  DISK_ANALYZING --> FAILED
-  CONVERTING --> FAILED
-  BLOCK_VALIDATING --> FAILED
-  UPLOADING --> FAILED
-  DEPLOYED --> FAILED
-  FAILED --> ROLLED_BACK
-```
-
-### State Intent
-- `PRECHECK`: VM state/config/disk/datastore validation and source metadata collection.
-- `SNAPSHOT_CREATED`: source rollback point created (ESXi).
-- `DISK_ANALYZING`: filesystem/layout/used-space analysis and disk strategy selection.
-- `CONVERTING`: disk conversion execution (individual or concatenated according to policy).
-- `BLOCK_VALIDATING`: `qemu-img check` and filesystem consistency checks on outputs.
-- `UPLOADING` / `DEPLOYED` / `VERIFIED`: OpenStack deployment + post-migration verification.
-
-## Domain Model
-
-```mermaid
-classDiagram
-  class MigrationJob {
-    +vm_name
-    +status
-    +conversion_metadata(JSON)
-    +transition(new_status)
-  }
-  class DiscoveredVM {
-    +name
-    +source
-    +cpu
-    +ram
-    +disks(JSON)
-    +metadata(JSON)
-    +power_state
-  }
-  class VmwareEndpointSession {
-    +host
-    +username
-    +password
-    +insecure
-  }
-  class OpenstackEndpointSession {
-    +auth_url
-    +username
-    +project_name
-    +to_connect_kwargs()
-  }
-
-  DiscoveredVM --> VmwareEndpointSession
-  MigrationJob --> DiscoveredVM : selected_source + vm_name
-  MigrationJob --> OpenstackEndpointSession : selected_openstack_endpoint_session_id
-```
-
-## Pipeline Responsibilities (Step-by-Step)
-
-1. Discovery:
-- Pull VM inventory from VMware.
-- Persist `DiscoveredVM` records with disk and metadata details.
-
-2. Pre-migration validation:
-- Verify source VM status and disk configuration.
-- Validate datastore metadata and source disk accessibility.
-- Run source-side checks (including `qemu-img check` where possible).
-- Collect disk/filesystem/partition metadata.
-
-3. Snapshot:
-- Create ESXi snapshot before conversion to guarantee rollback point.
-
-4. Disk handling:
-- Detect multi-disk topology.
-- Policy `individual`: convert all disks independently (1:1 mapping preserved).
-- Policy `concat`: concatenate converted disk payloads into one target image with mapping metadata.
-
-5. Conversion and integrity:
-- Execute `virt-v2v` or `qemu-img` conversion workflows.
-- Validate resulting artifacts using `qemu-img check`.
-- Run filesystem consistency/partition checks.
-
-6. OpenStack deployment + verification:
-- Upload image(s) to Glance.
-- Create Cinder volume(s), boot Nova server, attach remaining disks.
-- Validate image status, server status (`ACTIVE`), flavor/network expectations, and volume presence.
-
-7. Failure and rollback:
-- Any critical failure transitions job to `FAILED`.
-- Rollback task removes created OpenStack resources and temp artifacts.
-- Job final state becomes `ROLLED_BACK` when cleanup succeeds.
-
-## Technology Stack
-- Backend: Django, Django REST Framework
-- Async: Celery
-- Queue/backend: Redis
-- VMware: `pyVmomi`
-- OpenStack: `openstacksdk`
-- Conversion/validation tools: `virt-v2v`, `qemu-img`, `virt-filesystems`, `virt-df`, `guestfish`, `fsck`
-- Frontend: React + Vite
-- Optional automation: Ansible, Terraform
-
-## Repository Structure
 ```text
 backend/
-  core/                      # Django settings, URL root, celery/logging config
-  migrations/                # Domain models, tasks, clients, validation/conversion helpers
-frontend/                    # React SPA
-ansible/                     # Optional conversion playbooks
-terraform/                   # Optional infra provisioning modules
+  core/                      Django settings, URL config, Celery/logging config
+  migrations/                Models, serializers, task pipeline, provider clients
+frontend/                    React SPA (Vite)
+ansible/                     Optional conversion playbooks
+terraform/                   Optional OpenStack infra provisioning
 ```
 
-## API Surface (Current)
-Base path: `/api`
+## Production Safety Notes
 
-- `Health`: `GET /health`, `GET /openstack/health`
-- `VMware`: `GET /vmware/vms`, `POST /vmware/discover-now`, `POST /vmware/endpoints/test`, `POST /vmware/endpoints/connect`
-- `OpenStack`: `GET /openstack/images`, `GET /openstack/flavors`, `GET /openstack/networks`, `POST /openstack/endpoints/test`, `POST /openstack/endpoints/connect`
-- `Migrations`: `GET /migrations`, `GET /migrations/<job_id>`, `POST /migrations/from-vmware`, `POST /migrations/<job_id>/start`, `POST /migrations/<job_id>/rollback`
-- `Provisioning`: `POST /openstack/provision`, `GET /openstack/provision/status`
+- API authentication is not enforced at the view level (`AllowAny` is used on endpoints).
+- Protect API access with network controls and reverse proxy auth (VPN, private subnet, mTLS, SSO/OIDC gateway, or IP allow-list).
+- Credentials for VMware/OpenStack endpoint sessions are persisted in DB fields. Use encrypted storage at rest and strict DB access controls.
+- Keep risky feature flags disabled by default and enable them per environment only after validation.
 
-## Configuration Highlights
-- Feature flags control risky operations.
-- `ENABLE_REAL_CONVERSION`
-- `ENABLE_OPENSTACK_DEPLOYMENT`
-- `ENABLE_ROLLBACK`
-- `ENABLE_ANSIBLE_CONVERSION`
-- `ENABLE_TERRAFORM_INFRA`
-- `ENABLE_TERRAFORM_FROM_CELERY`
+## Prerequisites
 
-OpenStack credentials can be supplied via session records and/or `clouds.yaml` (`OPENSTACK_CLOUD_NAME`).
+### Core runtime
 
-## Local Runbook
+- Python 3 with `venv`
+- Node.js + npm (frontend)
+- Redis (Celery broker/result backend)
+- Database (SQLite for dev, PostgreSQL/MySQL recommended for production)
 
-### Backend
+### Migration host tools (worker node)
+
+Install and validate availability of:
+- `virt-v2v`
+- `qemu-img`
+- `virt-filesystems`
+- `virt-df`
+- `guestfish`
+- `fsck`
+
+Recommended check:
+
 ```bash
-cd /home/amin/Desktop/vm-migrator/backend
+which virt-v2v qemu-img virt-filesystems virt-df guestfish fsck
+```
+
+### Optional tools
+
+- `ansible-playbook` (if `ENABLE_ANSIBLE_CONVERSION=true`)
+- `terraform` (if `ENABLE_TERRAFORM_INFRA=true`)
+- `nbdkit` + VMware VDDK plugin/filter libs for ESXi `vddk` transport
+
+## Quick Start (Local Validation)
+
+### 1) Backend
+
+```bash
+cd backend
 python3 -m venv .venv
 source .venv/bin/activate
 pip install Django djangorestframework celery redis django-environ dj-database-url \
@@ -241,18 +116,333 @@ python manage.py migrate
 python manage.py runserver 0.0.0.0:8000
 ```
 
-### Worker
+### 2) Worker
+
 ```bash
-cd /home/amin/Desktop/vm-migrator/backend
+cd backend
 source .venv/bin/activate
 celery -A core worker -l info --concurrency=${CELERY_WORKER_CONCURRENCY:-2}
 ```
 
-### Frontend
+### 3) Optional: periodic discovery scheduler
+
 ```bash
-cd /home/amin/Desktop/vm-migrator/frontend
+cd backend
+source .venv/bin/activate
+celery -A core beat -l INFO
+```
+
+### 4) Frontend
+
+```bash
+cd frontend
 cp .env.example .env
 # Set VITE_API_BASE_URL=http://<backend-host>:8000
 npm install
 npm run dev -- --host
 ```
+
+## Production Deployment Model
+
+Run at least these long-lived processes:
+- `django-api`: `python manage.py runserver ...` (or gunicorn/uwsgi in production)
+- `celery-worker`: `celery -A core worker -l info ...`
+- `redis`: broker/backend
+- `frontend static hosting`: serve `frontend/dist` and proxy `/api/` to backend
+
+Optional process:
+- `celery-beat` if periodic VMware discovery is enabled.
+
+Recommended separation:
+- API and worker can be on separate nodes.
+- Worker node should have VMware/OpenStack connectivity and host conversion tools installed.
+
+## Configuration Reference (`backend/.env`)
+
+Start from `backend/.env.example`.
+
+### Required baseline
+
+- `SECRET_KEY`: strong random value
+- `DEBUG=false`
+- `ALLOWED_HOSTS`: production hostnames
+- `DATABASE_URL`: PostgreSQL/MySQL recommended in production
+- `REDIS_URL`
+- `TIME_ZONE`
+
+### Key feature flags
+
+- `ENABLE_REAL_CONVERSION`: run actual conversion (`false` means dry/stub behavior)
+- `ENABLE_OPENSTACK_DEPLOYMENT`: create real OpenStack resources
+- `ENABLE_ROLLBACK`: enable rollback task on failures
+- `ENABLE_PERIODIC_DISCOVERY`: enables Celery beat schedule
+- `ENABLE_ANSIBLE_CONVERSION`: use Ansible conversion path
+- `ENABLE_TERRAFORM_INFRA`: allow Terraform provisioning
+- `ENABLE_TERRAFORM_FROM_CELERY`: allow Terraform runs from async task
+
+### VMware settings
+
+- `VMWARE_WORKSTATION_PATHS`
+- `VMWARE_ESXI_HOST`
+- `VMWARE_ESXI_PORT`
+- `VMWARE_ESXI_USERNAME`
+- `VMWARE_ESXI_PASSWORD`
+- `VMWARE_ESXI_INSECURE`
+- `VMWARE_ESXI_CONVERSION_TRANSPORT` (`vddk` or `libvirt_esx`)
+- `VMWARE_VDDK_LIBDIR`
+- `VMWARE_VDDK_THUMBPRINT`
+- `VMWARE_VDDK_NBDKIT_PLUGIN_PATH`
+- `VMWARE_NBDKIT_BIN`
+- `VMWARE_NBDKIT_FILTER_PATH`
+- `VMWARE_REQUIRE_NO_SNAPSHOTS`
+
+### Conversion and artifact settings
+
+- `MIGRATION_OUTPUT_DIR`
+- `VIRT_V2V_TIMEOUT_SECONDS`
+- `ENABLE_ARTIFACT_BACKUP`
+- `ARTIFACT_BACKUP_DIR`
+- `ARTIFACT_BACKUP_REQUIRED`
+
+### OpenStack settings
+
+- `OPENSTACK_CLOUD_NAME`
+- `OPENSTACK_DEFAULT_NETWORK`
+- `OPENSTACK_IMAGE_ENDPOINT_OVERRIDE`
+- `OPENSTACK_VERIFY_TIMEOUT`
+- `OPENSTACK_VERIFY_POLL_INTERVAL`
+- `OPENSTACK_IMAGE_UPLOAD_TIMEOUT`
+- `OPENSTACK_IMAGE_UPLOAD_POLL_INTERVAL`
+- `OPENSTACK_API_RETRIES`
+- `OPENSTACK_API_RETRY_DELAY`
+
+Auth can come from:
+- Stored endpoint session via API (`/api/openstack/endpoints/connect`), or
+- `OS_*` env vars (`OS_AUTH_URL`, `OS_USERNAME`, `OS_PASSWORD`, ...), or
+- `clouds.yaml` with `OPENSTACK_CLOUD_NAME`.
+
+### Logging settings
+
+- `LOG_LEVEL`
+- `LOG_DIR`
+- `APP_LOG_MAX_BYTES`, `APP_LOG_BACKUP_COUNT`
+- `WORKER_LOG_MAX_BYTES`, `WORKER_LOG_BACKUP_COUNT`
+
+Logs are written to:
+- `backend/logs/app.log`
+- `backend/logs/worker.log`
+
+## API Reference
+
+Base path: `/api`
+
+### Health
+
+- `GET /health`
+- `GET /openstack/health`
+
+### VMware
+
+- `GET /vmware/vms`
+- `POST /vmware/discover-now`
+- `POST /vmware/endpoints/test`
+- `POST /vmware/endpoints/connect`
+
+### OpenStack
+
+- `GET /openstack/images`
+- `GET /openstack/flavors`
+- `GET /openstack/networks`
+- `POST /openstack/endpoints/test`
+- `POST /openstack/endpoints/connect`
+
+### Migrations
+
+- `GET /migrations`
+- `GET /migrations/<job_id>`
+- `POST /migrations/from-vmware`
+- `POST /migrations/<job_id>/start`
+- `POST /migrations/<job_id>/rollback`
+
+### Async task status
+
+- `GET /tasks/<task_id>`
+
+### OpenStack provisioning
+
+- `POST /openstack/provision`
+- `GET /openstack/provision/status`
+
+## Common Request Payloads
+
+### Test VMware endpoint
+
+```json
+{
+  "label": "esxi-lab-1",
+  "host": "10.0.0.20",
+  "port": 443,
+  "username": "root",
+  "password": "***",
+  "insecure": true
+}
+```
+
+### Connect OpenStack endpoint
+
+```json
+{
+  "label": "devstack-lab",
+  "auth_url": "http://10.0.0.30/identity",
+  "username": "admin",
+  "password": "***",
+  "project_name": "admin",
+  "user_domain_name": "Default",
+  "project_domain_name": "Default",
+  "region_name": "RegionOne",
+  "interface": "public",
+  "identity_api_version": "3",
+  "verify": false,
+  "image_endpoint_override": ""
+}
+```
+
+### Create migration jobs from discovered VMs
+
+```json
+{
+  "vmware_endpoint_session_id": 1,
+  "openstack_endpoint_session_id": 3,
+  "vms": [
+    {
+      "name": "web-01",
+      "source": "esxi",
+      "overrides": {
+        "flavor_id": "m1.medium",
+        "disk_layout_mode": "individual",
+        "network": {
+          "network_id": "a1b2c3d4-...",
+          "fixed_ip": "192.168.100.25"
+        }
+      }
+    }
+  ]
+}
+```
+
+`disk_layout_mode` accepted values:
+- `individual` (default)
+- `concat` (also accepts `merge`/`concatenate` aliases)
+
+## Operations Runbook
+
+### Bring-up checks
+
+1. `GET /api/health` returns `{"status":"ok"}`.
+2. Redis reachable from API and worker nodes.
+3. Worker running and can execute `migrations.celery_ping` or any queued task.
+4. `backend/logs/app.log` and `backend/logs/worker.log` are being written.
+
+### Discovery flow
+
+1. Configure VMware endpoint (`/api/vmware/endpoints/connect`).
+2. Trigger discovery (`/api/vmware/discover-now`).
+3. Poll task state (`/api/tasks/<task_id>`).
+4. Verify inventory (`/api/vmware/vms`).
+
+### Migration flow
+
+1. Create jobs (`/api/migrations/from-vmware`).
+2. Poll list/detail (`/api/migrations`, `/api/migrations/<id>`).
+3. If needed, force start (`/api/migrations/<id>/start`).
+4. On failed jobs, trigger rollback (`/api/migrations/<id>/rollback`).
+
+### OpenStack infra provisioning (optional)
+
+1. Ensure `ENABLE_TERRAFORM_INFRA=true`.
+2. If async provisioning is required, set `ENABLE_TERRAFORM_FROM_CELERY=true`.
+3. Trigger provisioning (`/api/openstack/provision`) with optional `var_overrides`.
+4. Check `/api/openstack/provision/status`.
+
+## Troubleshooting Guide
+
+### `No DiscoveredVM found for vm_name=...`
+
+Cause:
+- Selected VM is stale or endpoint session mismatch.
+
+Checks:
+- Re-run discovery for the same VMware endpoint session.
+- Verify `source` and `vmware_endpoint_session_id` used in migration creation.
+
+### `VMWARE_ESXI_* required` errors during conversion
+
+Cause:
+- Missing ESXi credentials/host in worker environment.
+
+Checks:
+- Ensure worker process has `VMWARE_ESXI_HOST`, `VMWARE_ESXI_USERNAME`, `VMWARE_ESXI_PASSWORD`.
+
+### `libguestfs cannot read host kernel image`
+
+Cause:
+- Host kernel image permissions block libguestfs/supermin.
+
+Checks:
+- Confirm `/boot/vmlinuz-<release>` is readable by worker user (or run worker with proper permissions).
+
+### Conversion artifacts missing / no QCOW2 produced
+
+Cause:
+- `virt-v2v` failure, output path issues, or disk tool errors.
+
+Checks:
+- Validate `MIGRATION_OUTPUT_DIR` exists and is writable.
+- Inspect worker logs for `ConversionExecutionError` and command stderr.
+- Check free disk space on worker host.
+
+### OpenStack upload or server verification timeout
+
+Cause:
+- Slow image import, connectivity, wrong endpoint, or cloud resource limits.
+
+Checks:
+- Increase `OPENSTACK_IMAGE_UPLOAD_TIMEOUT` / `OPENSTACK_VERIFY_TIMEOUT`.
+- Verify `OPENSTACK_IMAGE_ENDPOINT_OVERRIDE` if Glance endpoint is non-standard.
+- Confirm credentials, network, flavor, and quota availability.
+
+### Provisioning reports `SKIPPED`
+
+Cause:
+- Terraform feature flags disabled.
+
+Checks:
+- Set `ENABLE_TERRAFORM_INFRA=true`.
+- Set `ENABLE_TERRAFORM_FROM_CELERY=true` for API-triggered async provisioning.
+
+## Frontend Notes
+
+Frontend env:
+
+```env
+VITE_API_BASE_URL=http://<BACKEND_HOST>:8000
+```
+
+Production frontend:
+
+```bash
+cd frontend
+npm install
+npm run build
+```
+
+Serve `frontend/dist` from web server and proxy `/api/` to backend.
+
+## Support Handoff Checklist
+
+- `.env` values are documented per environment (dev/stage/prod).
+- Feature flags are explicitly reviewed before go-live.
+- Worker host has conversion binaries installed and validated.
+- Redis and DB backup/retention policy exists.
+- Log retention and central aggregation are configured.
+- Runbook for rollback and failed-job triage is shared with on-call support.
