@@ -115,6 +115,8 @@ class CreateMigrationFromVMwareSerializer(serializers.Serializer):
             ram = override_payload.get("ram")
             extra_disks = override_payload.get("extra_disks_gb")
             network = override_payload.get("network")
+            disk_layout_mode = override_payload.get("disk_layout_mode")
+            disk_merge = override_payload.get("disk_merge")
 
             if isinstance(flavor_id, str) and flavor_id.strip():
                 cleaned["flavor_id"] = flavor_id.strip()
@@ -124,6 +126,10 @@ class CreateMigrationFromVMwareSerializer(serializers.Serializer):
                 cleaned["ram"] = ram
             if isinstance(extra_disks, list):
                 cleaned["extra_disks_gb"] = [int(v) for v in extra_disks if isinstance(v, int) and v > 0]
+            if isinstance(disk_layout_mode, str) and disk_layout_mode.strip():
+                cleaned["disk_layout_mode"] = disk_layout_mode.strip()
+            if isinstance(disk_merge, bool) and disk_merge:
+                cleaned["disk_merge"] = True
             if isinstance(network, dict):
                 network_id = network.get("network_id")
                 network_name = network.get("network_name")
@@ -277,6 +283,41 @@ class OpenstackEndpointConnectSerializer(serializers.Serializer):
 
 
 class MigrationJobSummarySerializer(serializers.ModelSerializer):
+    user = serializers.SerializerMethodField()
+
     class Meta:
         model = MigrationJob
-        fields = ("id", "vm_name", "status", "created_at", "updated_at")
+        fields = (
+            "id",
+            "user",
+            "vm_name",
+            "source",
+            "destination",
+            "status",
+            "created_at",
+            "updated_at",
+        )
+
+    def get_user(self, obj):
+        if not obj.user:
+            return None
+        return {
+            "id": obj.user.id,
+            "username": obj.user.username,
+            "email": obj.user.email,
+            "role": getattr(obj.user, "role", ""),
+        }
+
+
+class MigrationJobCreateSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = MigrationJob
+        fields = ("id", "vm_name", "source", "destination", "status", "created_at", "updated_at")
+        read_only_fields = ("id", "status", "created_at", "updated_at")
+
+
+class MigrationJobDetailSerializer(MigrationJobSummarySerializer):
+    conversion_metadata = serializers.JSONField()
+
+    class Meta(MigrationJobSummarySerializer.Meta):
+        fields = MigrationJobSummarySerializer.Meta.fields + ("conversion_metadata",)

@@ -5,6 +5,7 @@ const STATUS_CLASS = {
   SUCCESS: 'status-success',
   SKIPPED: 'status-skipped',
   PENDING: 'status-pending',
+  COMPLETED: 'status-verified',
   DISCOVERED: 'status-discovered',
   PRECHECK: 'status-discovered',
   SNAPSHOT_CREATED: 'status-discovered',

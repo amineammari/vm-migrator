@@ -342,7 +342,6 @@ def ensure_server_booted_from_volume(
         retry_delay_seconds,
         lambda: conn.compute.create_server(
             name=server_name,
-            image_id=None,
             flavor_id=flavor_id,
             networks=[network_payload],
             block_device_mapping_v2=block_device_mapping_v2,

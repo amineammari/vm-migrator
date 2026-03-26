@@ -4,7 +4,7 @@ from celery.result import AsyncResult
 from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.exceptions import APIException
-from rest_framework.permissions import AllowAny
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 
 from .models import (
@@ -17,10 +17,13 @@ from .models import (
 from .openstack_client import OpenStackClient, OpenStackClientError
 from .serializers import (
     CreateMigrationFromVMwareSerializer,
+    MigrationJobCreateSerializer,
+    MigrationJobDetailSerializer,
     MigrationJobSummarySerializer,
     OpenstackEndpointConnectSerializer,
     VmwareEndpointConnectSerializer,
 )
+from .permissions import IsOwnerOrSuperAdmin, IsSuperAdmin
 from .tasks import (
     discover_vmware_vms,
     provision_openstack_infra,
@@ -30,6 +33,72 @@ from .tasks import (
 from .vmware_client import ESXiVMwareClient, VMwareClientError
 
 
+def _resolve_openstack_endpoint_session(*, requested_id: int | None = None) -> OpenstackEndpointSession | None:
+    """Return explicitly requested OpenStack session or latest passing one."""
+    if isinstance(requested_id, int):
+        return OpenstackEndpointSession.objects.filter(id=requested_id).first()
+    return (
+        OpenstackEndpointSession.objects.filter(last_test_status=OpenstackEndpointSession.TestStatus.PASSED)
+        .order_by("-updated_at")
+        .first()
+    )
+
+
+def _build_openstack_client(*, endpoint_session: OpenstackEndpointSession | None = None) -> OpenStackClient:
+    if endpoint_session is not None:
+        return OpenStackClient(auth_config=endpoint_session.to_connect_kwargs())
+    return OpenStackClient(cloud="openstack")
+
+
+def _parse_optional_int(value) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _resolve_external_network_id(client: OpenStackClient) -> str | None:
+    networks = client.list_networks_detail()
+    externals = [n for n in networks if n.get("is_router_external") is True and n.get("id")]
+    if not externals:
+        return None
+
+    externals.sort(key=lambda n: (0 if str(n.get("name", "")).strip().lower() == "public" else 1, str(n.get("name", ""))))
+    return str(externals[0]["id"])
+
+
+def _terraform_overrides_from_openstack_session(session: OpenstackEndpointSession) -> dict[str, object]:
+    """Map OpenStack endpoint session fields to Terraform variable names."""
+    overrides: dict[str, object] = {
+        "auth_url": session.auth_url,
+        "username": session.username,
+        "password": session.password,
+        "project_name": session.project_name,
+        "domain_name": session.user_domain_name or session.project_domain_name or "Default",
+    }
+    if session.region_name:
+        overrides["region"] = session.region_name
+    return overrides
+
+
+def _user_is_super_admin(user) -> bool:
+    return bool(user and user.is_authenticated and getattr(user, "role", None) == "SUPER_ADMIN")
+
+
+def _can_access_migration(user, job: MigrationJob) -> bool:
+    return _user_is_super_admin(user) or (job.user_id is not None and job.user_id == user.id)
+
+
+def _status_bucket(status_value: str) -> str:
+    if status_value in {MigrationJob.Status.FAILED, MigrationJob.Status.ROLLED_BACK}:
+        return "failed"
+    if status_value in {MigrationJob.Status.VERIFIED, MigrationJob.Status.DEPLOYED}:
+        return "completed"
+    return "running"
+
+
 @api_view(["GET"])
 @permission_classes([AllowAny])
 def health(request):
@@ -37,11 +106,18 @@ def health(request):
 
 
 @api_view(["GET"])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
 def openstack_health(request):
-    """Read-only OpenStack health summary for cloud='openstack'."""
+    """Read-only OpenStack health summary for selected/latest OpenStack endpoint session."""
+    requested_session_id = _parse_optional_int(request.query_params.get("openstack_endpoint_session_id"))
+    endpoint_session = _resolve_openstack_endpoint_session(requested_id=requested_session_id)
+    if requested_session_id is not None and endpoint_session is None:
+        return Response(
+            {"error": f"OpenStack endpoint session '{requested_session_id}' not found."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
     try:
-        client = OpenStackClient(cloud="openstack")
+        client = _build_openstack_client(endpoint_session=endpoint_session)
         project_id = client.validate_connection()
         images = client.list_images()
         flavors = client.list_flavors()
@@ -52,6 +128,7 @@ def openstack_health(request):
                 "image_count": len(images),
                 "flavor_count": len(flavors),
                 "network_count": len(networks),
+                "openstack_endpoint_session_id": endpoint_session.id if endpoint_session else None,
             },
             status=status.HTTP_200_OK,
         )
@@ -60,40 +137,79 @@ def openstack_health(request):
 
 
 @api_view(["GET"])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
 def openstack_images(request):
-    """Read-only list of OpenStack images."""
+    """Read-only list of OpenStack images for selected/latest OpenStack endpoint session."""
+    requested_session_id = _parse_optional_int(request.query_params.get("openstack_endpoint_session_id"))
+    endpoint_session = _resolve_openstack_endpoint_session(requested_id=requested_session_id)
+    if requested_session_id is not None and endpoint_session is None:
+        return Response(
+            {"error": f"OpenStack endpoint session '{requested_session_id}' not found."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
     try:
-        client = OpenStackClient(cloud="openstack")
-        return Response({"items": client.list_images()}, status=status.HTTP_200_OK)
+        client = _build_openstack_client(endpoint_session=endpoint_session)
+        return Response(
+            {
+                "items": client.list_images(),
+                "openstack_endpoint_session_id": endpoint_session.id if endpoint_session else None,
+            },
+            status=status.HTTP_200_OK,
+        )
     except OpenStackClientError as exc:
         return Response({"error": str(exc)}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
 
 
 @api_view(["GET"])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
 def openstack_flavors(request):
-    """Read-only list of OpenStack flavors."""
+    """Read-only list of OpenStack flavors for selected/latest OpenStack endpoint session."""
+    requested_session_id = _parse_optional_int(request.query_params.get("openstack_endpoint_session_id"))
+    endpoint_session = _resolve_openstack_endpoint_session(requested_id=requested_session_id)
+    if requested_session_id is not None and endpoint_session is None:
+        return Response(
+            {"error": f"OpenStack endpoint session '{requested_session_id}' not found."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
     try:
-        client = OpenStackClient(cloud="openstack")
-        return Response({"items": client.list_flavors()}, status=status.HTTP_200_OK)
+        client = _build_openstack_client(endpoint_session=endpoint_session)
+        return Response(
+            {
+                "items": client.list_flavors(),
+                "openstack_endpoint_session_id": endpoint_session.id if endpoint_session else None,
+            },
+            status=status.HTTP_200_OK,
+        )
     except OpenStackClientError as exc:
         return Response({"error": str(exc)}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
 
 
 @api_view(["GET"])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
 def openstack_networks(request):
-    """Read-only list of OpenStack networks."""
+    """Read-only list of OpenStack networks for selected/latest OpenStack endpoint session."""
+    requested_session_id = _parse_optional_int(request.query_params.get("openstack_endpoint_session_id"))
+    endpoint_session = _resolve_openstack_endpoint_session(requested_id=requested_session_id)
+    if requested_session_id is not None and endpoint_session is None:
+        return Response(
+            {"error": f"OpenStack endpoint session '{requested_session_id}' not found."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
     try:
-        client = OpenStackClient(cloud="openstack")
-        return Response({"items": client.list_networks_detail()}, status=status.HTTP_200_OK)
+        client = _build_openstack_client(endpoint_session=endpoint_session)
+        return Response(
+            {
+                "items": client.list_networks_detail(),
+                "openstack_endpoint_session_id": endpoint_session.id if endpoint_session else None,
+            },
+            status=status.HTTP_200_OK,
+        )
     except OpenStackClientError as exc:
         return Response({"error": str(exc)}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
 
 
 @api_view(["POST"])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
 def vmware_endpoint_test(request):
     serializer = VmwareEndpointConnectSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
@@ -120,7 +236,7 @@ def vmware_endpoint_test(request):
 
 
 @api_view(["POST"])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
 def vmware_endpoint_connect(request):
     serializer = VmwareEndpointConnectSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
@@ -198,8 +314,55 @@ def vmware_endpoint_connect(request):
     )
 
 
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def vmware_endpoint_detail(request, session_id: int):
+    session = VmwareEndpointSession.objects.filter(id=session_id).first()
+    if session is None:
+        return Response(
+            {"error": f"VMware endpoint session '{session_id}' not found."},
+            status=status.HTTP_404_NOT_FOUND,
+        )
+    return Response(
+        {
+            "vmware_endpoint_session": {
+                "id": session.id,
+                "label": session.label,
+                "host": session.host,
+                "port": session.port,
+                "username": session.username,
+                "insecure": session.insecure,
+                "last_test_status": session.last_test_status,
+                "last_test_at": session.last_test_at.isoformat() if session.last_test_at else None,
+            }
+        },
+        status=status.HTTP_200_OK,
+    )
+
+
 @api_view(["POST"])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
+def vmware_endpoint_close(request):
+    requested_session_id = _parse_optional_int(request.data.get("vmware_endpoint_session_id"))
+    if requested_session_id is None:
+        return Response(
+            {"error": "vmware_endpoint_session_id is required."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    session = VmwareEndpointSession.objects.filter(id=requested_session_id).first()
+    if session is None:
+        return Response(
+            {"error": f"VMware endpoint session '{requested_session_id}' not found."},
+            status=status.HTTP_404_NOT_FOUND,
+        )
+
+    session.delete()
+    return Response({"ok": True}, status=status.HTTP_200_OK)
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
 def openstack_endpoint_test(request):
     serializer = OpenstackEndpointConnectSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
@@ -244,7 +407,7 @@ def openstack_endpoint_test(request):
 
 
 @api_view(["POST"])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
 def openstack_endpoint_connect(request):
     serializer = OpenstackEndpointConnectSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
@@ -304,7 +467,55 @@ def openstack_endpoint_connect(request):
 
 
 @api_view(["GET"])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
+def openstack_endpoint_detail(request, session_id: int):
+    session = OpenstackEndpointSession.objects.filter(id=session_id).first()
+    if session is None:
+        return Response(
+            {"error": f"OpenStack endpoint session '{session_id}' not found."},
+            status=status.HTTP_404_NOT_FOUND,
+        )
+    return Response(
+        {
+            "openstack_endpoint_session": {
+                "id": session.id,
+                "label": session.label,
+                "auth_url": session.auth_url,
+                "username": session.username,
+                "project_name": session.project_name,
+                "region_name": session.region_name,
+                "verify": session.verify,
+                "last_test_status": session.last_test_status,
+                "last_test_at": session.last_test_at.isoformat() if session.last_test_at else None,
+            }
+        },
+        status=status.HTTP_200_OK,
+    )
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def openstack_endpoint_close(request):
+    requested_session_id = _parse_optional_int(request.data.get("openstack_endpoint_session_id"))
+    if requested_session_id is None:
+        return Response(
+            {"error": "openstack_endpoint_session_id is required."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    session = OpenstackEndpointSession.objects.filter(id=requested_session_id).first()
+    if session is None:
+        return Response(
+            {"error": f"OpenStack endpoint session '{requested_session_id}' not found."},
+            status=status.HTTP_404_NOT_FOUND,
+        )
+
+    session.delete()
+    return Response({"ok": True}, status=status.HTTP_200_OK)
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
 def vmware_vms(request):
     """Return discovered VMware VMs from local persistence (read-only API)."""
     endpoint_session_id = request.query_params.get("endpoint_session_id")
@@ -336,34 +547,56 @@ def vmware_vms(request):
     return Response({"items": items}, status=status.HTTP_200_OK)
 
 
-@api_view(["GET"])
-@permission_classes([AllowAny])
+@api_view(["GET", "POST"])
+@permission_classes([IsAuthenticated])
 def list_migrations(request):
-    """List migration jobs for dashboard polling."""
-    jobs = MigrationJob.objects.order_by("-created_at")
+    if request.method == "POST":
+        serializer = MigrationJobCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        job = serializer.save(user=request.user, status=MigrationJob.Status.PENDING)
+        return Response(MigrationJobDetailSerializer(job).data, status=status.HTTP_201_CREATED)
+
+    jobs = MigrationJob.objects.select_related("user").order_by("-created_at")
+    if not _user_is_super_admin(request.user):
+        jobs = jobs.filter(user=request.user)
+    else:
+        requested_user_id = _parse_optional_int(request.query_params.get("user_id"))
+        requested_username = str(request.query_params.get("username", "") or "").strip()
+        if requested_user_id is not None:
+            jobs = jobs.filter(user_id=requested_user_id)
+        if requested_username:
+            jobs = jobs.filter(user__username__icontains=requested_username)
+        allowed_ordering = {
+            "created_at": "created_at",
+            "-created_at": "-created_at",
+            "updated_at": "updated_at",
+            "-updated_at": "-updated_at",
+            "vm_name": "vm_name",
+            "-vm_name": "-vm_name",
+            "status": "status",
+            "-status": "-status",
+            "username": "user__username",
+            "-username": "-user__username",
+        }
+        order_by = str(request.query_params.get("ordering", "-created_at") or "-created_at")
+        jobs = jobs.order_by(allowed_ordering.get(order_by, "-created_at"))
     return Response(MigrationJobSummarySerializer(jobs, many=True).data, status=status.HTTP_200_OK)
 
 
 @api_view(["GET"])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
 def migration_detail(request, job_id: int):
-    """Return one migration job including conversion metadata."""
     try:
-        job = MigrationJob.objects.get(id=job_id)
+        job = MigrationJob.objects.select_related("user").get(id=job_id)
     except MigrationJob.DoesNotExist:
         return Response({"error": f"Migration job {job_id} not found."}, status=status.HTTP_404_NOT_FOUND)
-
-    payload = MigrationJobSummarySerializer(job).data
-    payload["conversion_metadata"] = job.conversion_metadata
-    conversion = job.conversion_metadata if isinstance(job.conversion_metadata, dict) else {}
-    conversion_stage = conversion.get("conversion", {}) if isinstance(conversion.get("conversion"), dict) else {}
-    execution = conversion_stage.get("execution", {}) if isinstance(conversion_stage.get("execution"), dict) else {}
-    payload["disk_analysis"] = execution.get("disk_analysis", [])
-    return Response(payload, status=status.HTTP_200_OK)
+    if not _can_access_migration(request.user, job):
+        return Response({"detail": IsOwnerOrSuperAdmin.message}, status=status.HTTP_403_FORBIDDEN)
+    return Response(MigrationJobDetailSerializer(job).data, status=status.HTTP_200_OK)
 
 
 @api_view(["POST"])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
 def create_migrations_from_vmware(request):
     """Create migration jobs from selected discovered VMware VMs."""
     serializer = CreateMigrationFromVMwareSerializer(data=request.data, context={})
@@ -387,6 +620,7 @@ def create_migrations_from_vmware(request):
 
     created_jobs = []
     skipped_jobs = []
+    queued_job_ids: list[int] = []
 
     try:
         with transaction.atomic():
@@ -422,7 +656,10 @@ def create_migrations_from_vmware(request):
                     continue
 
                 job = MigrationJob.objects.create(
+                    user=request.user,
                     vm_name=vm_name,
+                    source=source,
+                    destination=openstack_endpoint_session.project_name,
                     status=MigrationJob.Status.PENDING,
                     conversion_metadata={
                         "selected_source": source,
@@ -441,8 +678,8 @@ def create_migrations_from_vmware(request):
                     }
                 )
 
-                # Trigger async pipeline stub (PENDING -> DISCOVERED).
-                start_migration.delay(job.id)
+                queued_job_ids.append(job.id)
+            transaction.on_commit(lambda: [start_migration.delay(queued_job_id) for queued_job_id in queued_job_ids])
     except Exception as exc:
         raise APIException(f"Failed to create migration jobs: {exc}") from exc
 
@@ -456,7 +693,7 @@ def create_migrations_from_vmware(request):
 
 
 @api_view(["POST"])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
 def discover_now(request):
     """
     Enqueue a discovery run immediately (async) and return the Celery task id.
@@ -493,7 +730,7 @@ def discover_now(request):
 
 
 @api_view(["POST"])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
 def start_migration_now(request, job_id: int):
     """Enqueue start_migration(job_id) (async) and return the Celery task id."""
     async_result = start_migration.delay(job_id)
@@ -501,7 +738,7 @@ def start_migration_now(request, job_id: int):
 
 
 @api_view(["POST"])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
 def rollback_migration_now(request, job_id: int):
     """Enqueue rollback_migration(job_id) (async) and return the Celery task id."""
     context = request.data if isinstance(request.data, dict) else {}
@@ -557,19 +794,56 @@ def _summarize_provision_result(res: AsyncResult) -> tuple[str, str]:
 
 
 @api_view(["POST"])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
 def openstack_provision_now(request):
     """Enqueue OpenStack infra provisioning (async) and track the task id."""
     body = request.data if isinstance(request.data, dict) else {}
-    var_overrides = body.get("var_overrides")
-    if not isinstance(var_overrides, dict):
-        var_overrides = {}
+    var_overrides = body.get("var_overrides") if isinstance(body.get("var_overrides"), dict) else {}
+    requested_session_id = _parse_optional_int(body.get("openstack_endpoint_session_id"))
+    endpoint_session = _resolve_openstack_endpoint_session(requested_id=requested_session_id)
+    if requested_session_id is not None and endpoint_session is None:
+        return Response(
+            {"error": f"OpenStack endpoint session '{requested_session_id}' not found."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
 
-    async_result = provision_openstack_infra.delay(var_overrides=var_overrides)
+    effective_overrides: dict[str, object] = {}
+    if endpoint_session is not None:
+        effective_overrides.update(_terraform_overrides_from_openstack_session(endpoint_session))
+        if "external_network_id" not in var_overrides:
+            try:
+                client = _build_openstack_client(endpoint_session=endpoint_session)
+                external_network_id = _resolve_external_network_id(client)
+            except OpenStackClientError as exc:
+                return Response(
+                    {"error": f"OpenStack external network lookup failed: {exc}"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if external_network_id:
+                effective_overrides["external_network_id"] = external_network_id
+
+    effective_overrides.update(var_overrides)
+    if "external_network_id" not in effective_overrides:
+        return Response(
+            {
+                "error": (
+                    "Missing external_network_id for Terraform provisioning. "
+                    "Provide var_overrides.external_network_id or connect/select an OpenStack endpoint "
+                    "with an external network."
+                )
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    async_result = provision_openstack_infra.delay(var_overrides=effective_overrides)
     run = OpenStackProvisioningRun.objects.create(
         task_id=async_result.id,
         state="QUEUED",
-        message="Queued",
+        message=(
+            f"Queued (OpenStack session #{endpoint_session.id})"
+            if endpoint_session is not None
+            else "Queued"
+        ),
     )
     return Response(
         {
@@ -578,13 +852,14 @@ def openstack_provision_now(request):
             "state": run.state,
             "message": run.message,
             "queued": True,
+            "openstack_endpoint_session_id": endpoint_session.id if endpoint_session else None,
         },
         status=status.HTTP_202_ACCEPTED,
     )
 
 
 @api_view(["GET"])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
 def openstack_provision_status(request):
     """Return the latest OpenStack provisioning task status."""
     run = OpenStackProvisioningRun.objects.order_by("-created_at").first()
@@ -625,7 +900,7 @@ def openstack_provision_status(request):
 
 
 @api_view(["GET"])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
 def task_status(request, task_id: str):
     """Return Celery task state and (when available) its result."""
     res = AsyncResult(task_id)
@@ -639,3 +914,28 @@ def task_status(request, task_id: str):
         # Result is expected to be JSON-serializable (dict/str/etc.)
         payload["result"] = res.result
     return Response(payload, status=status.HTTP_200_OK)
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def dashboard(request):
+    jobs = MigrationJob.objects.select_related("user").order_by("-created_at")
+    if not _user_is_super_admin(request.user):
+        jobs = jobs.filter(user=request.user)
+    else:
+        requested_user_id = _parse_optional_int(request.query_params.get("user_id"))
+        if requested_user_id is not None:
+            jobs = jobs.filter(user_id=requested_user_id)
+
+    status_buckets = {"completed": 0, "running": 0, "failed": 0}
+    for item in jobs:
+        status_buckets[_status_bucket(item.status)] += 1
+
+    return Response(
+        {
+            "total_migrations": jobs.count(),
+            "stats_by_status": status_buckets,
+            "migrations": MigrationJobSummarySerializer(jobs[:25], many=True).data,
+        },
+        status=status.HTTP_200_OK,
+    )

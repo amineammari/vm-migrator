@@ -185,8 +185,12 @@ def _ensure_libguestfs_kernel_readable() -> None:
     On some hardened installs, `/boot/vmlinuz-*` is mode 0600 (root-only) which
     causes supermin to fail and virt-v2v to exit early.
     """
-    release = os.uname().release
-    kernel = Path("/boot") / f"vmlinuz-{release}"
+    configured_kernel = os.getenv("SUPERMIN_KERNEL", "").strip()
+    if configured_kernel:
+        kernel = Path(configured_kernel).expanduser()
+    else:
+        release = os.uname().release
+        kernel = Path("/boot") / f"vmlinuz-{release}"
     if kernel.exists() and not os.access(kernel, os.R_OK):
         raise ConversionPlanningError(
             f"libguestfs cannot read host kernel image: {kernel}. "
@@ -662,6 +666,10 @@ def _execute_virt_v2v(
     start = time.monotonic()
 
     run_env = os.environ.copy()
+    supermin_kernel = os.getenv("SUPERMIN_KERNEL", "").strip()
+    if supermin_kernel:
+        run_env["SUPERMIN_KERNEL"] = supermin_kernel
+
     # If using VDDK transport, ensure nbdkit can locate the vddk plugin and VDDK libs.
     transport = os.getenv("VMWARE_ESXI_CONVERSION_TRANSPORT", "").strip().lower()
     if transport == "vddk":
@@ -1225,7 +1233,8 @@ def _validate_openstack_post_migration(
     server_status = str(getattr(server, "status", "")).upper()
     server_flavor = getattr(server, "flavor", {}) or {}
     server_flavor_id = str(server_flavor.get("id", ""))
-    flavor = conn.compute.get_flavor(expected_flavor_id)
+    expected_flavor = conn.compute.get_flavor(expected_flavor_id)
+    actual_flavor = conn.compute.get_flavor(server_flavor_id) if server_flavor_id else None
     server_addresses = getattr(server, "addresses", {}) or {}
 
     volume_checks: list[dict[str, Any]] = []
@@ -1249,6 +1258,16 @@ def _validate_openstack_post_migration(
             for net_item in conn.network.networks()
         ) and network_ok
 
+    actual_cpu = int(getattr(actual_flavor, "vcpus", 0) or 0)
+    actual_ram = int(getattr(actual_flavor, "ram", 0) or 0)
+    expected_flavor_cpu = int(getattr(expected_flavor, "vcpus", 0) or 0)
+    expected_flavor_ram = int(getattr(expected_flavor, "ram", 0) or 0)
+    flavor_resources_ok = (
+        (expected_cpu is None or actual_cpu >= int(expected_cpu))
+        and (expected_ram is None or actual_ram >= int(expected_ram))
+    )
+    flavor_id_match = server_flavor_id == str(expected_flavor_id)
+
     checks = {
         "images": image_checks,
         "server": {
@@ -1257,15 +1276,17 @@ def _validate_openstack_post_migration(
             "expected_flavor_id": expected_flavor_id,
             "expected_cpu": expected_cpu,
             "expected_ram": expected_ram,
-            "actual_cpu": int(getattr(flavor, "vcpus", 0) or 0),
-            "actual_ram": int(getattr(flavor, "ram", 0) or 0),
+            "expected_flavor_cpu": expected_flavor_cpu,
+            "expected_flavor_ram": expected_flavor_ram,
+            "actual_cpu": actual_cpu,
+            "actual_ram": actual_ram,
+            "flavor_id_match": flavor_id_match,
+            "flavor_resources_ok": flavor_resources_ok,
             "addresses": server_addresses,
             "network_ok": network_ok,
             "ok": (
                 server_status == "ACTIVE"
-                and server_flavor_id == str(expected_flavor_id)
-                and (expected_cpu is None or int(getattr(flavor, "vcpus", 0) or 0) >= int(expected_cpu))
-                and (expected_ram is None or int(getattr(flavor, "ram", 0) or 0) >= int(expected_ram))
+                and flavor_resources_ok
                 and network_ok
             ),
         },
@@ -1321,6 +1342,11 @@ def _run_openstack_deployment(job: MigrationJob, discovered_vm: DiscoveredVM) ->
     names = build_openstack_names(job.vm_name, job.id)
     target_spec = _effective_target_spec(job, discovered_vm)
 
+    def _persist_openstack_progress() -> None:
+        metadata["openstack"] = os_meta
+        job.conversion_metadata = metadata
+        job.save(update_fields=["conversion_metadata", "updated_at"])
+
     if target_spec.get("flavor_id"):
         flavor = get_flavor_choice_by_id(conn, target_spec["flavor_id"])
     else:
@@ -1355,6 +1381,11 @@ def _run_openstack_deployment(job: MigrationJob, discovered_vm: DiscoveredVM) ->
             retry_delay_seconds=int(getattr(settings, "OPENSTACK_API_RETRY_DELAY", 3)),
         )
         image_ids.append(image_id)
+        os_meta["image_id"] = image_ids[0]
+        os_meta["image_ids"] = list(image_ids)
+        os_meta["image_name"] = names["image_name"]
+        os_meta["image_names"] = [names["image_name"]] + [f"{names['image_name']}-disk{i}" for i in range(1, len(image_ids))]
+        _persist_openstack_progress()
 
     existing_volume_ids = os_meta.get("volume_ids") if isinstance(os_meta.get("volume_ids"), list) else []
     attached_volumes: list[dict[str, Any]] = []
@@ -1375,6 +1406,9 @@ def _run_openstack_deployment(job: MigrationJob, discovered_vm: DiscoveredVM) ->
             retry_delay_seconds=int(getattr(settings, "OPENSTACK_API_RETRY_DELAY", 3)),
         )
         converted_volume_ids.append(volume_id)
+        os_meta["boot_volume_id"] = converted_volume_ids[0]
+        os_meta["volume_ids"] = list(converted_volume_ids)
+        _persist_openstack_progress()
 
     if len(converted_volume_ids) != len(qcow2_paths):
         raise OpenStackDeploymentError(
@@ -1400,6 +1434,9 @@ def _run_openstack_deployment(job: MigrationJob, discovered_vm: DiscoveredVM) ->
         retries=int(getattr(settings, "OPENSTACK_API_RETRIES", 2)),
         retry_delay_seconds=int(getattr(settings, "OPENSTACK_API_RETRY_DELAY", 3)),
     )
+    os_meta["server_id"] = server_id
+    os_meta["server_name"] = names["server_name"]
+    _persist_openstack_progress()
 
     # Wait for Nova to finish server build before attaching non-boot volumes.
     server_ready_status = verify_server_active(
@@ -1439,6 +1476,8 @@ def _run_openstack_deployment(job: MigrationJob, discovered_vm: DiscoveredVM) ->
                 "boot": False,
             }
         )
+        os_meta["attached_volumes"] = list(attached_volumes)
+        _persist_openstack_progress()
 
     extra_volume_ids = os_meta.get("extra_volume_ids") if isinstance(os_meta.get("extra_volume_ids"), list) else []
     requested_extra_disks = target_spec["extra_disks_gb"]
@@ -1459,6 +1498,8 @@ def _run_openstack_deployment(job: MigrationJob, discovered_vm: DiscoveredVM) ->
             retry_delay_seconds=int(getattr(settings, "OPENSTACK_API_RETRY_DELAY", 3)),
         )
         extra_volume_ids.append(volume_id)
+        os_meta["extra_volume_ids"] = list(extra_volume_ids)
+        _persist_openstack_progress()
 
         attach_status = attach_volume_to_server(
             conn,
@@ -1476,6 +1517,8 @@ def _run_openstack_deployment(job: MigrationJob, discovered_vm: DiscoveredVM) ->
                 "status": attach_status,
             }
         )
+        os_meta["attached_volumes"] = list(attached_volumes)
+        _persist_openstack_progress()
 
     os_meta.update(
         {

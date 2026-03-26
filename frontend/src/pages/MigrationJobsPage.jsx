@@ -18,6 +18,7 @@ function MigrationJobsPage() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [provisioningBusy, setProvisioningBusy] = useState(false)
+  const openstackEndpointSessionId = Number(localStorage.getItem('active_openstack_endpoint_session_id')) || null
 
   useEffect(() => {
     let mounted = true
@@ -26,7 +27,7 @@ function MigrationJobsPage() {
       try {
         const [jobItems, healthData, provisionData] = await Promise.all([
           fetchMigrationJobs(),
-          fetchOpenStackHealth(),
+          fetchOpenStackHealth(openstackEndpointSessionId),
           fetchOpenStackProvisionStatus(),
         ])
         if (!mounted) return
@@ -48,13 +49,13 @@ function MigrationJobsPage() {
       mounted = false
       clearInterval(timer)
     }
-  }, [])
+  }, [openstackEndpointSessionId])
 
   async function handleProvision() {
     setProvisioningBusy(true)
     setError('')
     try {
-      await triggerOpenStackProvision()
+      await triggerOpenStackProvision({ openstack_endpoint_session_id: openstackEndpointSessionId })
       const provisionData = await fetchOpenStackProvisionStatus()
       setProvisioning(provisionData)
     } catch (err) {

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -51,6 +52,7 @@ class AnsibleRunner:
         )
 
         started = time.monotonic()
+        run_env = os.environ.copy()
         try:
             completed = subprocess.run(
                 cmd,
@@ -58,6 +60,7 @@ class AnsibleRunner:
                 text=True,
                 check=False,
                 timeout=timeout_seconds,
+                env=run_env,
             )
         except FileNotFoundError as exc:
             raise AnsibleRunnerError("ansible-playbook binary not found") from exc

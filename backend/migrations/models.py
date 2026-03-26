@@ -1,3 +1,4 @@
+from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db import models
 
@@ -36,7 +37,16 @@ class MigrationJob(models.Model):
         Status.ROLLED_BACK: set(),
     }
 
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="migration_jobs",
+    )
     vm_name = models.CharField(max_length=255)
+    source = models.CharField(max_length=255, blank=True, default="")
+    destination = models.CharField(max_length=255, blank=True, default="")
     status = models.CharField(
         max_length=20,
         choices=Status.choices,

@@ -1,13 +1,22 @@
-import { Fragment, useMemo, useState } from 'react'
+import { Fragment, useEffect, useMemo, useState } from 'react'
 import {
+  closeVMwareEndpointSession,
   connectVMwareEndpoint,
   discoverVMwareNow,
+  fetchVMwareEndpointSession,
   fetchTaskStatus,
   fetchVMwareVMs,
   testVMwareEndpoint,
   triggerMigrations,
 } from '../api/vmware'
-import { connectOpenstackEndpoint, testOpenstackEndpoint } from '../api/openstack'
+import {
+  closeOpenstackEndpointSession,
+  connectOpenstackEndpoint,
+  fetchOpenStackFlavors,
+  fetchOpenStackNetworks,
+  fetchOpenstackEndpointSession,
+  testOpenstackEndpoint,
+} from '../api/openstack'
 import PanelState from '../components/PanelState'
 
 function VMwareInventoryPage() {
@@ -66,6 +75,52 @@ function VMwareInventoryPage() {
     () => vms.filter((vm) => selectedKeys.has(makeKey(vm))),
     [vms, selectedKeys],
   )
+
+  useEffect(() => {
+    let mounted = true
+
+    async function restoreSessions() {
+      const storedVmwareId = Number(localStorage.getItem('active_vmware_endpoint_session_id')) || null
+      const storedOpenstackId = Number(localStorage.getItem('active_openstack_endpoint_session_id')) || null
+
+      if (storedVmwareId) {
+        try {
+          const session = await fetchVMwareEndpointSession(storedVmwareId)
+          if (!mounted) return
+          setActiveVmwareEndpoint(session)
+          await loadVMs(storedVmwareId)
+        } catch {
+          if (!mounted) return
+          localStorage.removeItem('active_vmware_endpoint_session_id')
+          setActiveVmwareEndpoint(null)
+        }
+      }
+
+      if (storedOpenstackId) {
+        try {
+          const session = await fetchOpenstackEndpointSession(storedOpenstackId)
+          if (!mounted) return
+          setActiveOpenstackEndpoint(session)
+          const [flavorsData, networksData] = await Promise.all([
+            fetchOpenStackFlavors(storedOpenstackId),
+            fetchOpenStackNetworks(storedOpenstackId),
+          ])
+          if (!mounted) return
+          setFlavors(flavorsData)
+          setNetworks(networksData)
+        } catch {
+          if (!mounted) return
+          localStorage.removeItem('active_openstack_endpoint_session_id')
+          setActiveOpenstackEndpoint(null)
+        }
+      }
+    }
+
+    restoreSessions()
+    return () => {
+      mounted = false
+    }
+  }, [])
 
   async function loadVMs(endpointSessionId) {
     if (typeof endpointSessionId !== 'number') return
@@ -230,6 +285,10 @@ function VMwareInventoryPage() {
     try {
       const res = await connectVMwareEndpoint(vmwareForm)
       setActiveVmwareEndpoint(res?.vmware_endpoint_session || null)
+      const endpointId = res?.vmware_endpoint_session?.id
+      if (endpointId) {
+        localStorage.setItem('active_vmware_endpoint_session_id', String(endpointId))
+      }
       setVMs(Array.isArray(res?.items) ? res.items : [])
       setSelectedKeys(new Set())
       setSpecByKey({})
@@ -241,6 +300,23 @@ function VMwareInventoryPage() {
       setError(err.message || 'Connexion VMware impossible.')
     } finally {
       setVmwareConnecting(false)
+    }
+  }
+
+  async function handleVmwareDisconnect() {
+    if (!activeVmwareEndpoint?.id) return
+    setError('')
+    try {
+      await closeVMwareEndpointSession(activeVmwareEndpoint.id)
+    } catch (err) {
+      setError(err.message || 'Impossible de fermer la session VMware.')
+    } finally {
+      localStorage.removeItem('active_vmware_endpoint_session_id')
+      setActiveVmwareEndpoint(null)
+      setVMs([])
+      setSelectedKeys(new Set())
+      setSpecByKey({})
+      setExpandedVmKey('')
     }
   }
 
@@ -266,6 +342,10 @@ function VMwareInventoryPage() {
     try {
       const res = await connectOpenstackEndpoint(openstackForm)
       setActiveOpenstackEndpoint(res?.openstack_endpoint_session || null)
+      const endpointId = res?.openstack_endpoint_session?.id
+      if (endpointId) {
+        localStorage.setItem('active_openstack_endpoint_session_id', String(endpointId))
+      }
       setFlavors(Array.isArray(res?.flavors) ? res.flavors : [])
       setNetworks(Array.isArray(res?.networks) ? res.networks : [])
       setShowOpenstackModal(false)
@@ -275,6 +355,21 @@ function VMwareInventoryPage() {
       setOpenstackError(err.message || 'Connexion OpenStack impossible.')
     } finally {
       setOpenstackConnecting(false)
+    }
+  }
+
+  async function handleOpenstackDisconnect() {
+    if (!activeOpenstackEndpoint?.id) return
+    setOpenstackError('')
+    try {
+      await closeOpenstackEndpointSession(activeOpenstackEndpoint.id)
+    } catch (err) {
+      setOpenstackError(err.message || 'Impossible de fermer la session OpenStack.')
+    } finally {
+      localStorage.removeItem('active_openstack_endpoint_session_id')
+      setActiveOpenstackEndpoint(null)
+      setFlavors([])
+      setNetworks([])
     }
   }
 
@@ -297,8 +392,22 @@ function VMwareInventoryPage() {
           <button className="secondary-btn" onClick={() => setShowVmwareModal(true)} disabled={submitting}>
             Connect ESXi
           </button>
+          <button
+            className="secondary-btn"
+            onClick={handleVmwareDisconnect}
+            disabled={submitting || !activeVmwareEndpoint}
+          >
+            Disconnect ESXi
+          </button>
           <button className="secondary-btn" onClick={() => setShowOpenstackModal(true)} disabled={submitting}>
             Connect OpenStack
+          </button>
+          <button
+            className="secondary-btn"
+            onClick={handleOpenstackDisconnect}
+            disabled={submitting || !activeOpenstackEndpoint}
+          >
+            Disconnect OpenStack
           </button>
           <button className="secondary-btn" onClick={refreshFromESXi} disabled={loading || refreshing || submitting || !activeVmwareEndpoint}>
             {refreshing ? 'Refreshing...' : 'Refresh'}

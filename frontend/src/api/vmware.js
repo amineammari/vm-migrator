@@ -48,3 +48,15 @@ export async function connectVMwareEndpoint(payload) {
     body: JSON.stringify(payload),
   })
 }
+
+export async function fetchVMwareEndpointSession(sessionId) {
+  const data = await apiFetch(`/api/vmware/endpoints/${encodeURIComponent(String(sessionId))}`)
+  return data?.vmware_endpoint_session || null
+}
+
+export async function closeVMwareEndpointSession(sessionId) {
+  return apiFetch('/api/vmware/endpoints/close', {
+    method: 'POST',
+    body: JSON.stringify({ vmware_endpoint_session_id: sessionId }),
+  })
+}
