@@ -86,6 +86,16 @@ def celery_ping():
     return {"status": "ok", "message": "celery task executed"}
 
 
+def _openstack_session_for_job(job: MigrationJob, session_id: int | None) -> OpenstackEndpointSession | None:
+    if not isinstance(session_id, int):
+        return None
+    qs = OpenstackEndpointSession.objects.filter(id=session_id)
+    user_role = getattr(getattr(job, "user", None), "role", None)
+    if user_role != "SUPER_ADMIN":
+        qs = qs.filter(user_id=job.user_id)
+    return qs.first()
+
+
 def _truncate_log(text: str, limit: int = 12000) -> str:
     if len(text) <= limit:
         return text
@@ -973,10 +983,17 @@ def _rollback_openstack_resources(job: MigrationJob, actions: list[dict[str, Any
     try:
         auth_overrides = None
         if isinstance(selected_openstack_endpoint_session_id, int):
-            openstack_session = OpenstackEndpointSession.objects.filter(
-                id=selected_openstack_endpoint_session_id
-            ).first()
-            auth_overrides = openstack_session.to_connect_kwargs() if openstack_session else None
+            openstack_session = _openstack_session_for_job(job, selected_openstack_endpoint_session_id)
+            if openstack_session is None:
+                actions.append(
+                    {
+                        "action": "openstack_cleanup",
+                        "status": "error",
+                        "error": "OpenStack session is missing or unauthorized for this job.",
+                    }
+                )
+                return
+            auth_overrides = openstack_session.to_connect_kwargs()
         conn = connect_openstack(cloud=cloud, auth_overrides=auth_overrides)
     except OpenStackDeploymentError as exc:
         actions.append({"action": "openstack_cleanup", "status": "error", "error": str(exc)})
@@ -1332,8 +1349,10 @@ def _run_openstack_deployment(job: MigrationJob, discovered_vm: DiscoveredVM) ->
     cloud = getattr(settings, "OPENSTACK_CLOUD_NAME", "openstack")
     auth_overrides = None
     if isinstance(selected_openstack_endpoint_session_id, int):
-        openstack_session = OpenstackEndpointSession.objects.filter(id=selected_openstack_endpoint_session_id).first()
-        auth_overrides = openstack_session.to_connect_kwargs() if openstack_session else None
+        openstack_session = _openstack_session_for_job(job, selected_openstack_endpoint_session_id)
+        if openstack_session is None:
+            raise OpenStackDeploymentError("OpenStack session is missing or unauthorized for this job.")
+        auth_overrides = openstack_session.to_connect_kwargs()
     conn = connect_openstack(cloud=cloud, auth_overrides=auth_overrides)
 
     os_meta = metadata.get("openstack", {}) if isinstance(metadata.get("openstack"), dict) else {}

@@ -1,6 +1,7 @@
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db import models
+from django_cryptography.fields import encrypt
 
 
 class InvalidTransitionError(ValidationError):
@@ -121,6 +122,13 @@ class DiscoveredVM(models.Model):
 
 
 class OpenStackProvisioningRun(models.Model):
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="openstack_provisioning_runs",
+    )
     task_id = models.CharField(max_length=255, unique=True, db_index=True)
     state = models.CharField(max_length=32, default="QUEUED")
     message = models.TextField(blank=True, default="")
@@ -140,11 +148,18 @@ class VmwareEndpointSession(models.Model):
         PASSED = "PASSED", "Passed"
         FAILED = "FAILED", "Failed"
 
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="vmware_endpoint_sessions",
+    )
     label = models.CharField(max_length=255, blank=True, default="")
     host = models.CharField(max_length=255)
     port = models.PositiveIntegerField(default=443)
     username = models.CharField(max_length=255)
-    password = models.CharField(max_length=1024)
+    password = encrypt(models.CharField(max_length=1024))
     insecure = models.BooleanField(default=True)
     last_test_status = models.CharField(max_length=16, choices=TestStatus.choices, default=TestStatus.UNKNOWN)
     last_test_message = models.TextField(blank=True, default="")
@@ -166,10 +181,17 @@ class OpenstackEndpointSession(models.Model):
         PASSED = "PASSED", "Passed"
         FAILED = "FAILED", "Failed"
 
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="openstack_endpoint_sessions",
+    )
     label = models.CharField(max_length=255, blank=True, default="")
     auth_url = models.CharField(max_length=512)
     username = models.CharField(max_length=255)
-    password = models.CharField(max_length=1024)
+    password = encrypt(models.CharField(max_length=1024))
     project_name = models.CharField(max_length=255)
     user_domain_name = models.CharField(max_length=255, default="Default")
     project_domain_name = models.CharField(max_length=255, default="Default")

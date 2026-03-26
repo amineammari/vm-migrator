@@ -33,21 +33,25 @@ from .tasks import (
 from .vmware_client import ESXiVMwareClient, VMwareClientError
 
 
-def _resolve_openstack_endpoint_session(*, requested_id: int | None = None) -> OpenstackEndpointSession | None:
-    """Return explicitly requested OpenStack session or latest passing one."""
+def _session_queryset(user, model_cls):
+    qs = model_cls.objects.all()
+    if not _user_is_super_admin(user):
+        qs = qs.filter(user=user)
+    return qs
+
+
+def _resolve_openstack_endpoint_session(*, user, requested_id: int | None = None) -> OpenstackEndpointSession | None:
+    """Return explicitly requested OpenStack session limited to user scope."""
+    qs = _session_queryset(user, OpenstackEndpointSession)
     if isinstance(requested_id, int):
-        return OpenstackEndpointSession.objects.filter(id=requested_id).first()
-    return (
-        OpenstackEndpointSession.objects.filter(last_test_status=OpenstackEndpointSession.TestStatus.PASSED)
-        .order_by("-updated_at")
-        .first()
-    )
+        return qs.filter(id=requested_id).first()
+    return None
 
 
 def _build_openstack_client(*, endpoint_session: OpenstackEndpointSession | None = None) -> OpenStackClient:
-    if endpoint_session is not None:
-        return OpenStackClient(auth_config=endpoint_session.to_connect_kwargs())
-    return OpenStackClient(cloud="openstack")
+    if endpoint_session is None:
+        raise OpenStackClientError("OpenStack endpoint session is required.")
+    return OpenStackClient(auth_config=endpoint_session.to_connect_kwargs())
 
 
 def _parse_optional_int(value) -> int | None:
@@ -110,10 +114,10 @@ def health(request):
 def openstack_health(request):
     """Read-only OpenStack health summary for selected/latest OpenStack endpoint session."""
     requested_session_id = _parse_optional_int(request.query_params.get("openstack_endpoint_session_id"))
-    endpoint_session = _resolve_openstack_endpoint_session(requested_id=requested_session_id)
-    if requested_session_id is not None and endpoint_session is None:
+    endpoint_session = _resolve_openstack_endpoint_session(user=request.user, requested_id=requested_session_id)
+    if endpoint_session is None:
         return Response(
-            {"error": f"OpenStack endpoint session '{requested_session_id}' not found."},
+            {"error": "OpenStack endpoint session is required and must belong to you."},
             status=status.HTTP_400_BAD_REQUEST,
         )
     try:
@@ -141,10 +145,10 @@ def openstack_health(request):
 def openstack_images(request):
     """Read-only list of OpenStack images for selected/latest OpenStack endpoint session."""
     requested_session_id = _parse_optional_int(request.query_params.get("openstack_endpoint_session_id"))
-    endpoint_session = _resolve_openstack_endpoint_session(requested_id=requested_session_id)
-    if requested_session_id is not None and endpoint_session is None:
+    endpoint_session = _resolve_openstack_endpoint_session(user=request.user, requested_id=requested_session_id)
+    if endpoint_session is None:
         return Response(
-            {"error": f"OpenStack endpoint session '{requested_session_id}' not found."},
+            {"error": "OpenStack endpoint session is required and must belong to you."},
             status=status.HTTP_400_BAD_REQUEST,
         )
     try:
@@ -165,10 +169,10 @@ def openstack_images(request):
 def openstack_flavors(request):
     """Read-only list of OpenStack flavors for selected/latest OpenStack endpoint session."""
     requested_session_id = _parse_optional_int(request.query_params.get("openstack_endpoint_session_id"))
-    endpoint_session = _resolve_openstack_endpoint_session(requested_id=requested_session_id)
-    if requested_session_id is not None and endpoint_session is None:
+    endpoint_session = _resolve_openstack_endpoint_session(user=request.user, requested_id=requested_session_id)
+    if endpoint_session is None:
         return Response(
-            {"error": f"OpenStack endpoint session '{requested_session_id}' not found."},
+            {"error": "OpenStack endpoint session is required and must belong to you."},
             status=status.HTTP_400_BAD_REQUEST,
         )
     try:
@@ -189,10 +193,10 @@ def openstack_flavors(request):
 def openstack_networks(request):
     """Read-only list of OpenStack networks for selected/latest OpenStack endpoint session."""
     requested_session_id = _parse_optional_int(request.query_params.get("openstack_endpoint_session_id"))
-    endpoint_session = _resolve_openstack_endpoint_session(requested_id=requested_session_id)
-    if requested_session_id is not None and endpoint_session is None:
+    endpoint_session = _resolve_openstack_endpoint_session(user=request.user, requested_id=requested_session_id)
+    if endpoint_session is None:
         return Response(
-            {"error": f"OpenStack endpoint session '{requested_session_id}' not found."},
+            {"error": "OpenStack endpoint session is required and must belong to you."},
             status=status.HTTP_400_BAD_REQUEST,
         )
     try:
@@ -253,6 +257,7 @@ def vmware_endpoint_connect(request):
             last_test_status=VmwareEndpointSession.TestStatus.PASSED,
             last_test_message="Connection successful.",
             last_test_at=timezone.now(),
+            user=request.user,
         )
         result = discover_vmware_vms(
             include_workstation=False,
@@ -317,7 +322,7 @@ def vmware_endpoint_connect(request):
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def vmware_endpoint_detail(request, session_id: int):
-    session = VmwareEndpointSession.objects.filter(id=session_id).first()
+    session = _session_queryset(request.user, VmwareEndpointSession).filter(id=session_id).first()
     if session is None:
         return Response(
             {"error": f"VMware endpoint session '{session_id}' not found."},
@@ -350,11 +355,11 @@ def vmware_endpoint_close(request):
             status=status.HTTP_400_BAD_REQUEST,
         )
 
-    session = VmwareEndpointSession.objects.filter(id=requested_session_id).first()
+    session = _session_queryset(request.user, VmwareEndpointSession).filter(id=requested_session_id).first()
     if session is None:
         return Response(
-            {"error": f"VMware endpoint session '{requested_session_id}' not found."},
-            status=status.HTTP_404_NOT_FOUND,
+            {"error": "VMware endpoint session not found or not accessible."},
+            status=status.HTTP_403_FORBIDDEN,
         )
 
     session.delete()
@@ -429,6 +434,7 @@ def openstack_endpoint_connect(request):
         last_test_status=OpenstackEndpointSession.TestStatus.PASSED,
         last_test_message="Connection successful.",
         last_test_at=timezone.now(),
+        user=request.user,
     )
     try:
         client = OpenStackClient(auth_config=session.to_connect_kwargs())
@@ -469,10 +475,10 @@ def openstack_endpoint_connect(request):
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def openstack_endpoint_detail(request, session_id: int):
-    session = OpenstackEndpointSession.objects.filter(id=session_id).first()
+    session = _session_queryset(request.user, OpenstackEndpointSession).filter(id=session_id).first()
     if session is None:
         return Response(
-            {"error": f"OpenStack endpoint session '{session_id}' not found."},
+            {"error": "OpenStack endpoint session not found or not accessible."},
             status=status.HTTP_404_NOT_FOUND,
         )
     return Response(
@@ -503,11 +509,11 @@ def openstack_endpoint_close(request):
             status=status.HTTP_400_BAD_REQUEST,
         )
 
-    session = OpenstackEndpointSession.objects.filter(id=requested_session_id).first()
+    session = _session_queryset(request.user, OpenstackEndpointSession).filter(id=requested_session_id).first()
     if session is None:
         return Response(
-            {"error": f"OpenStack endpoint session '{requested_session_id}' not found."},
-            status=status.HTTP_404_NOT_FOUND,
+            {"error": "OpenStack endpoint session not found or not accessible."},
+            status=status.HTTP_403_FORBIDDEN,
         )
 
     session.delete()
@@ -519,12 +525,15 @@ def openstack_endpoint_close(request):
 def vmware_vms(request):
     """Return discovered VMware VMs from local persistence (read-only API)."""
     endpoint_session_id = request.query_params.get("endpoint_session_id")
-    qs = DiscoveredVM.objects.order_by("-last_seen", "name")
+    qs = DiscoveredVM.objects.select_related("vmware_endpoint_session").order_by("-last_seen", "name")
+    if not _user_is_super_admin(request.user):
+        qs = qs.filter(vmware_endpoint_session__user=request.user)
     if endpoint_session_id:
         try:
-            qs = qs.filter(vmware_endpoint_session_id=int(endpoint_session_id))
+            endpoint_session_id = int(endpoint_session_id)
         except (TypeError, ValueError):
             return Response({"error": "Invalid endpoint_session_id query parameter."}, status=status.HTTP_400_BAD_REQUEST)
+        qs = qs.filter(vmware_endpoint_session_id=endpoint_session_id)
     items = [
         {
             "id": vm.id,
@@ -599,7 +608,7 @@ def migration_detail(request, job_id: int):
 @permission_classes([IsAuthenticated])
 def create_migrations_from_vmware(request):
     """Create migration jobs from selected discovered VMware VMs."""
-    serializer = CreateMigrationFromVMwareSerializer(data=request.data, context={})
+    serializer = CreateMigrationFromVMwareSerializer(data=request.data, context={"request": request})
     serializer.is_valid(raise_exception=True)
 
     vmware_endpoint_session = serializer.context["vmware_endpoint_session"]
@@ -711,6 +720,14 @@ def discover_now(request):
             vmware_endpoint_session_id = int(vmware_endpoint_session_id)
         except (TypeError, ValueError):
             return Response({"error": "vmware_endpoint_session_id must be an integer."}, status=status.HTTP_400_BAD_REQUEST)
+        session = _session_queryset(request.user, VmwareEndpointSession).filter(id=vmware_endpoint_session_id).first()
+        if session is None:
+            return Response({"error": "VMware endpoint session not found or not accessible."}, status=status.HTTP_403_FORBIDDEN)
+    else:
+        return Response(
+            {"error": "vmware_endpoint_session_id is required for discovery."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
 
     async_result = discover_vmware_vms.delay(
         include_workstation=include_workstation,
@@ -733,6 +750,13 @@ def discover_now(request):
 @permission_classes([IsAuthenticated])
 def start_migration_now(request, job_id: int):
     """Enqueue start_migration(job_id) (async) and return the Celery task id."""
+    try:
+        job = MigrationJob.objects.select_related("user").get(id=job_id)
+    except MigrationJob.DoesNotExist:
+        return Response({"error": f"Migration job {job_id} not found."}, status=status.HTTP_404_NOT_FOUND)
+    if not _can_access_migration(request.user, job):
+        return Response({"detail": IsOwnerOrSuperAdmin.message}, status=status.HTTP_403_FORBIDDEN)
+
     async_result = start_migration.delay(job_id)
     return Response({"task_id": async_result.id, "queued": True, "job_id": job_id}, status=status.HTTP_202_ACCEPTED)
 
@@ -741,13 +765,20 @@ def start_migration_now(request, job_id: int):
 @permission_classes([IsAuthenticated])
 def rollback_migration_now(request, job_id: int):
     """Enqueue rollback_migration(job_id) (async) and return the Celery task id."""
+    try:
+        job = MigrationJob.objects.select_related("user").get(id=job_id)
+    except MigrationJob.DoesNotExist:
+        return Response({"error": f"Migration job {job_id} not found."}, status=status.HTTP_404_NOT_FOUND)
+    if not _can_access_migration(request.user, job):
+        return Response({"detail": IsOwnerOrSuperAdmin.message}, status=status.HTTP_403_FORBIDDEN)
+
     context = request.data if isinstance(request.data, dict) else {}
     async_result = rollback_migration.delay(job_id, context=context)
     return Response({"task_id": async_result.id, "queued": True, "job_id": job_id}, status=status.HTTP_202_ACCEPTED)
 
 
 @api_view(["POST"])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
 def terraform_apply_now(request):
     """Enqueue terraform infrastructure provisioning task."""
     body = request.data if isinstance(request.data, dict) else {}
@@ -800,10 +831,10 @@ def openstack_provision_now(request):
     body = request.data if isinstance(request.data, dict) else {}
     var_overrides = body.get("var_overrides") if isinstance(body.get("var_overrides"), dict) else {}
     requested_session_id = _parse_optional_int(body.get("openstack_endpoint_session_id"))
-    endpoint_session = _resolve_openstack_endpoint_session(requested_id=requested_session_id)
-    if requested_session_id is not None and endpoint_session is None:
+    endpoint_session = _resolve_openstack_endpoint_session(user=request.user, requested_id=requested_session_id)
+    if endpoint_session is None:
         return Response(
-            {"error": f"OpenStack endpoint session '{requested_session_id}' not found."},
+            {"error": "OpenStack endpoint session is required and must belong to you."},
             status=status.HTTP_400_BAD_REQUEST,
         )
 
@@ -844,6 +875,7 @@ def openstack_provision_now(request):
             if endpoint_session is not None
             else "Queued"
         ),
+        user=request.user,
     )
     return Response(
         {
@@ -862,7 +894,10 @@ def openstack_provision_now(request):
 @permission_classes([IsAuthenticated])
 def openstack_provision_status(request):
     """Return the latest OpenStack provisioning task status."""
-    run = OpenStackProvisioningRun.objects.order_by("-created_at").first()
+    runs = OpenStackProvisioningRun.objects
+    if not _user_is_super_admin(request.user):
+        runs = runs.filter(user=request.user)
+    run = runs.order_by("-created_at").first()
     if run is None:
         return Response(
             {

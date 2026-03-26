@@ -449,7 +449,8 @@ cd backend
 python3 -m venv .venv
 source .venv/bin/activate
 pip install Django djangorestframework djangorestframework-simplejwt \
-  celery redis django-environ dj-database-url pyvmomi openstacksdk \
+  celery redis django-environ dj-database-url django-cryptography \
+  pyvmomi openstacksdk \
   mysqlclient psycopg2-binary
 cp .env.example .env
 python manage.py migrate
@@ -688,10 +689,17 @@ Recommended controls:
 - Serve the API behind HTTPS and rotate the Django `SECRET_KEY` and JWT signing key if compromised.
 - Restrict self-registration in production (disable public exposure or gate it behind admin invite flows).
 - Harden token handling: short access lifetime is enabled; consider enabling refresh rotation/blacklisting if needed.
+- Encrypt endpoint credentials at rest (this project uses `django-cryptography` with `SECRET_KEY`); rotate credentials if the Django secret key or database are exposed.
 - Restrict API via private network, VPN, or zero-trust gateway.
 - Encrypt secrets at rest and use secret manager integration.
 - Remove state files and secrets from Git history; manage Terraform state remotely and securely.
 - Keep TLS verification enabled in production environments.
+
+### 15.1 Secrets Handling
+- Never commit real `.env`, SQL dumps, Terraform state, PID/schedule files, or dev outputs. `.gitignore` blocks these; keep it that way.
+- Always set a unique `SECRET_KEY` in `backend/.env` (the default in code is unsafe).
+- Use per-user endpoint sessions; delete sessions when no longer needed.
+- See `SECURITY_REMEDIATION.md` for rotation and history-cleanup steps after any exposure.
 
 ## 16. Operations and Maintenance
 

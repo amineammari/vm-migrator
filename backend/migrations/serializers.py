@@ -1,11 +1,22 @@
 from __future__ import annotations
 
 from collections import Counter
+from typing import Optional
 
+from django.contrib.auth import get_user_model
 from rest_framework import serializers
 
 from .models import DiscoveredVM, MigrationJob, OpenstackEndpointSession, VmwareEndpointSession
 from .openstack_client import OpenStackClient, OpenStackClientError
+
+User = get_user_model()
+
+
+def _session_for_user(model_cls, session_id: int, user) -> Optional[object]:
+    qs = model_cls.objects.filter(id=session_id)
+    if not user or getattr(user, "role", None) != User.Role.SUPER_ADMIN:
+        qs = qs.filter(user=user)
+    return qs.first()
 
 
 class NetworkOverrideSerializer(serializers.Serializer):
@@ -61,15 +72,17 @@ class CreateMigrationFromVMwareSerializer(serializers.Serializer):
     vms = SelectedVMSerializer(many=True, allow_empty=False)
 
     def validate_vms(self, value):
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
         vmware_endpoint_session_id = self.initial_data.get("vmware_endpoint_session_id")
         openstack_endpoint_session_id = self.initial_data.get("openstack_endpoint_session_id")
 
-        vmware_session = VmwareEndpointSession.objects.filter(id=vmware_endpoint_session_id).first()
+        vmware_session = _session_for_user(VmwareEndpointSession, vmware_endpoint_session_id, user)
         if vmware_session is None:
-            raise serializers.ValidationError("Invalid vmware_endpoint_session_id.")
-        openstack_session = OpenstackEndpointSession.objects.filter(id=openstack_endpoint_session_id).first()
+            raise serializers.ValidationError("Invalid or unauthorized vmware_endpoint_session_id.")
+        openstack_session = _session_for_user(OpenstackEndpointSession, openstack_endpoint_session_id, user)
         if openstack_session is None:
-            raise serializers.ValidationError("Invalid openstack_endpoint_session_id.")
+            raise serializers.ValidationError("Invalid or unauthorized openstack_endpoint_session_id.")
 
         self.context["vmware_endpoint_session"] = vmware_session
         self.context["openstack_endpoint_session"] = openstack_session

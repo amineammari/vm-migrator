@@ -7,10 +7,16 @@ from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.test import SimpleTestCase, TestCase
+from django.utils import timezone
 from rest_framework.test import APIClient
 
 from .disk_formats import DiskConversionError, convert_with_qemu_img, detect_disk_format
-from .models import MigrationJob
+from .models import (
+    DiscoveredVM,
+    MigrationJob,
+    OpenstackEndpointSession,
+    VmwareEndpointSession,
+)
 from .serializers import VMOverridesSerializer
 
 
@@ -364,3 +370,143 @@ class AuthAndRBACTests(TestCase):
         admin_response = self.client.get(f"/api/dashboard?user_id={self.user.id}")
         self.assertEqual(admin_response.status_code, 200)
         self.assertEqual(admin_response.data["total_migrations"], 3)
+
+
+class SessionOwnershipTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.super_admin = User.objects.create_user(
+            username="admin",
+            email="admin@example.com",
+            password="secret123",
+            role=User.Role.SUPER_ADMIN,
+        )
+        self.user = User.objects.create_user(
+            username="alice",
+            email="alice@example.com",
+            password="secret123",
+            role=User.Role.USER,
+        )
+        self.other_user = User.objects.create_user(
+            username="bob",
+            email="bob@example.com",
+            password="secret123",
+            role=User.Role.USER,
+        )
+        self.vmware_user_session = VmwareEndpointSession.objects.create(
+            label="own",
+            host="1.1.1.1",
+            port=443,
+            username="root",
+            password="pw",
+            insecure=True,
+            user=self.user,
+        )
+        self.vmware_other_session = VmwareEndpointSession.objects.create(
+            label="other",
+            host="2.2.2.2",
+            port=443,
+            username="root",
+            password="pw",
+            insecure=True,
+            user=self.other_user,
+        )
+        self.openstack_user_session = OpenstackEndpointSession.objects.create(
+            label="own-os",
+            auth_url="http://os.example.com",
+            username="alice",
+            password="pw",
+            project_name="proj",
+            user_domain_name="Default",
+            project_domain_name="Default",
+            region_name="",
+            interface="",
+            identity_api_version="",
+            verify=False,
+            image_endpoint_override="",
+            user=self.user,
+        )
+        self.openstack_other_session = OpenstackEndpointSession.objects.create(
+            label="other-os",
+            auth_url="http://os.example.com",
+            username="bob",
+            password="pw",
+            project_name="proj2",
+            user_domain_name="Default",
+            project_domain_name="Default",
+            region_name="",
+            interface="",
+            identity_api_version="",
+            verify=False,
+            image_endpoint_override="",
+            user=self.other_user,
+        )
+
+    def test_user_cannot_view_other_vmware_detail(self):
+        self.client.force_authenticate(self.user)
+        response = self.client.get(f"/api/vmware/endpoints/{self.vmware_other_session.id}")
+        self.assertEqual(response.status_code, 404)
+
+    def test_super_admin_can_view_any_vmware_detail(self):
+        self.client.force_authenticate(self.super_admin)
+        response = self.client.get(f"/api/vmware/endpoints/{self.vmware_other_session.id}")
+        self.assertEqual(response.status_code, 200)
+
+    def test_user_cannot_close_other_vmware_session(self):
+        self.client.force_authenticate(self.user)
+        response = self.client.post(
+            "/api/vmware/endpoints/close",
+            {"vmware_endpoint_session_id": self.vmware_other_session.id},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertTrue(VmwareEndpointSession.objects.filter(id=self.vmware_other_session.id).exists())
+
+    def test_user_cannot_view_other_openstack_detail(self):
+        self.client.force_authenticate(self.user)
+        response = self.client.get(f"/api/openstack/endpoints/{self.openstack_other_session.id}")
+        self.assertEqual(response.status_code, 404)
+
+    @patch("migrations.views.start_migration.delay")
+    def test_user_cannot_create_migration_with_unowned_sessions(self, mock_delay):
+        self.client.force_authenticate(self.user)
+        response = self.client.post(
+            "/api/migrations/from-vmware",
+            {
+                "vmware_endpoint_session_id": self.vmware_other_session.id,
+                "openstack_endpoint_session_id": self.openstack_other_session.id,
+                "vms": [{"name": "vm1", "source": "esxi"}],
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(MigrationJob.objects.count(), 0)
+        mock_delay.assert_not_called()
+
+    @patch("migrations.views.start_migration.delay")
+    def test_user_creates_migration_with_owned_sessions(self, mock_delay):
+        DiscoveredVM.objects.create(
+            name="vm-owned",
+            source=DiscoveredVM.Source.ESXI,
+            vmware_endpoint_session=self.vmware_user_session,
+            cpu=1,
+            ram=1024,
+            disks=[],
+            metadata={},
+            power_state="off",
+            last_seen=timezone.now(),
+        )
+
+        self.client.force_authenticate(self.user)
+        response = self.client.post(
+            "/api/migrations/from-vmware",
+            {
+                "vmware_endpoint_session_id": self.vmware_user_session.id,
+                "openstack_endpoint_session_id": self.openstack_user_session.id,
+                "vms": [{"name": "vm-owned", "source": "esxi"}],
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(MigrationJob.objects.count(), 1)
+        mock_delay.assert_called_once()
