@@ -448,12 +448,16 @@ Backend:
 cd backend
 python3 -m venv .venv
 source .venv/bin/activate
-pip install Django djangorestframework celery redis django-environ dj-database-url \
-  pyvmomi openstacksdk mysqlclient psycopg2-binary
+pip install Django djangorestframework djangorestframework-simplejwt \
+  celery redis django-environ dj-database-url pyvmomi openstacksdk \
+  mysqlclient psycopg2-binary
 cp .env.example .env
 python manage.py migrate
+python manage.py createsuperuser  # set role=SUPER_ADMIN via admin UI or shell after creation
 python manage.py runserver 0.0.0.0:8000
 ```
+
+- After creating the superuser, set its role to `SUPER_ADMIN` (via `/admin` or Django shell) so it can manage users and view all migrations.
 
 Worker:
 
@@ -534,6 +538,15 @@ Frontend env file:
 | `VITE_API_BASE_URL` | `http://localhost:8000` | API base URL for browser calls |
 | `VITE_PROXY_TARGET` | `http://127.0.0.1:8000` | Vite dev proxy target for `/api` |
 
+### 12.4 Authentication & RBAC
+
+- Authentication uses JWT via `djangorestframework-simplejwt`. Access tokens last 30 minutes; refresh tokens last 7 days (see `SIMPLE_JWT` in `backend/core/settings.py` for tuning).
+- Default permission is `IsAuthenticated`; only `/api/health` and auth endpoints are public.
+- Roles:
+  - `SUPER_ADMIN`: manage users, view all migrations, filter by `user_id`, and access any migration detail.
+  - `USER`: can register/login, see their own profile, create migrations, and view only their own migrations/dashboard stats.
+- Attach `Authorization: Bearer <access_token>` to all non-public requests.
+
 ## 13. Usage
 
 ### 13.1 API endpoints
@@ -542,14 +555,43 @@ Base path: `/api`
 
 | Area | Endpoints |
 | --- | --- |
+| Auth | `POST /auth/register`, `POST /auth/login`, `POST /auth/refresh`, `GET /auth/me` |
 | Health | `GET /health`, `GET /openstack/health` |
+| Users | `GET/POST /users/`, `GET/PUT/DELETE /users/{id}` (SUPER_ADMIN only) |
 | VMware | `GET /vmware/vms`, `POST /vmware/discover-now`, `POST /vmware/endpoints/test`, `POST /vmware/endpoints/connect` |
 | OpenStack | `GET /openstack/images`, `GET /openstack/flavors`, `GET /openstack/networks`, `POST /openstack/endpoints/test`, `POST /openstack/endpoints/connect` |
 | Migrations | `GET /migrations`, `GET /migrations/{job_id}`, `POST /migrations/from-vmware`, `POST /migrations/{job_id}/start`, `POST /migrations/{job_id}/rollback` |
 | Tasks | `GET /tasks/{task_id}` |
 | Provisioning | `POST /openstack/provision`, `GET /openstack/provision/status` |
 
+All endpoints (except `/api/health` and auth routes) require an `Authorization: Bearer <access_token>` header. User management (`/api/users/**`) is restricted to `SUPER_ADMIN` role.
+
 ### 13.2 Common workflow commands (curl examples)
+
+Register, login, and grab tokens:
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/api/auth/register \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"alice","email":"alice@example.com","password":"secret123"}'
+
+LOGIN=$(curl -s -X POST http://127.0.0.1:8000/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"alice","password":"secret123"}')
+ACCESS_TOKEN=$(echo "$LOGIN" | jq -r '.access')
+REFRESH_TOKEN=$(echo "$LOGIN" | jq -r '.refresh')
+
+curl -s -X POST http://127.0.0.1:8000/api/auth/refresh \
+  -H 'Content-Type: application/json' \
+  -d "{\"refresh\":\"${REFRESH_TOKEN}\"}"
+```
+
+Use the access token on subsequent requests:
+
+```bash
+curl -s http://127.0.0.1:8000/api/dashboard \
+  -H "Authorization: Bearer ${ACCESS_TOKEN}"
+```
 
 Health check:
 
@@ -632,17 +674,20 @@ Recommended enterprise extension:
 ## 15. Security Considerations
 
 Current security posture from code analysis:
-- API endpoints are currently decorated with `AllowAny`.
+- JWT authentication is enforced by default; only `/api/health` and auth endpoints are public.
+- Role-based access: `SUPER_ADMIN` can manage users and view all migrations; regular users are scoped to their own data.
 - Endpoint credentials (VMware/OpenStack) are stored in DB model fields.
 - SSL verify flags can be disabled (`insecure`, `OS_VERIFY=false`).
 
 Key risks:
-- Unauthenticated API access if exposed publicly.
+- Initial super admin must be created and have `role=SUPER_ADMIN`; otherwise RBAC protections lose enforcement power.
 - Plain credential persistence without explicit field encryption in models.
 - Sensitive Terraform state file tracked in repository (`terraform/terraform.tfstate`).
 
 Recommended controls:
-- Enforce API authentication and authorization (token/OIDC/session hardening).
+- Serve the API behind HTTPS and rotate the Django `SECRET_KEY` and JWT signing key if compromised.
+- Restrict self-registration in production (disable public exposure or gate it behind admin invite flows).
+- Harden token handling: short access lifetime is enabled; consider enabling refresh rotation/blacklisting if needed.
 - Restrict API via private network, VPN, or zero-trust gateway.
 - Encrypt secrets at rest and use secret manager integration.
 - Remove state files and secrets from Git history; manage Terraform state remotely and securely.
@@ -721,7 +766,7 @@ Limitations observed:
 ## 19. Future Improvements / Roadmap
 
 Recommended roadmap items:
-1. Add robust authentication/authorization and role-based access.
+1. Add SSO/OIDC integration, MFA, and finer-grained permission policies.
 2. Add encrypted credential storage and secret manager integration.
 3. Add native observability stack (metrics, traces, dashboards, alerts).
 4. Move Terraform state to remote backend and remove local state from repository.
