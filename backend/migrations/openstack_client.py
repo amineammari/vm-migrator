@@ -203,6 +203,66 @@ class OpenStackClient:
         except Exception as exc:
             raise OpenStackClientError(f"Unexpected error while listing OpenStack networks: {exc}") from exc
 
+    def create_network(
+        self,
+        *,
+        name: str,
+        subnet_name: str,
+        cidr: str,
+        gateway_ip: str | None = None,
+        enable_dhcp: bool = True,
+        allocation_pool_start: str | None = None,
+        allocation_pool_end: str | None = None,
+        dns_nameservers: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Create a network and an IPv4 subnet, then return the formatted network details."""
+        try:
+            existing = self._conn.network.find_network(name, ignore_missing=True)
+            if existing is not None:
+                raise OpenStackClientError(f"Network '{name}' already exists.")
+
+            network = self._conn.network.create_network(name=name)
+            subnet_payload: dict[str, Any] = {
+                "name": subnet_name or f"{name}-subnet",
+                "network_id": network.id,
+                "ip_version": 4,
+                "cidr": cidr,
+                "enable_dhcp": bool(enable_dhcp),
+            }
+            if gateway_ip:
+                subnet_payload["gateway_ip"] = gateway_ip
+            if allocation_pool_start and allocation_pool_end:
+                subnet_payload["allocation_pools"] = [
+                    {"start": allocation_pool_start, "end": allocation_pool_end}
+                ]
+            if dns_nameservers:
+                subnet_payload["dns_nameservers"] = list(dns_nameservers)
+
+            try:
+                self._conn.network.create_subnet(**subnet_payload)
+            except Exception:
+                self._conn.network.delete_network(network.id, ignore_missing=True)
+                raise
+
+            created = next(
+                (item for item in self.list_networks_detail() if str(item.get("id")) == str(network.id)),
+                None,
+            )
+            return created or {
+                "id": network.id,
+                "name": network.name,
+                "status": getattr(network, "status", None),
+                "is_admin_state_up": getattr(network, "is_admin_state_up", None),
+                "is_router_external": getattr(network, "is_router_external", None),
+                "subnets": [],
+            }
+        except OpenStackClientError:
+            raise
+        except (os_exceptions.SDKException, ks_exceptions.ClientException) as exc:
+            raise OpenStackClientError(f"Failed to create OpenStack network: {exc}") from exc
+        except Exception as exc:
+            raise OpenStackClientError(f"Unexpected error while creating OpenStack network: {exc}") from exc
+
     def validate_fixed_ip(self, *, network_id: str, fixed_ip: str) -> tuple[bool, str | None]:
         """Validate fixed IP against allocation pools and existing ports."""
         try:

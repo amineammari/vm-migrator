@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from django.contrib.auth import get_user_model
 from django.test import SimpleTestCase, TestCase
@@ -17,7 +17,14 @@ from .models import (
     OpenstackEndpointSession,
     VmwareEndpointSession,
 )
-from .serializers import VMOverridesSerializer
+from .openstack_client import OpenStackClientError
+from .openstack_deployment import (
+    _auto_fix_image_endpoint,
+    _normalize_image_endpoint_override,
+    delete_volume_if_exists,
+    find_flavor_choice,
+)
+from .serializers import CreateMigrationFromVMwareSerializer, VMOverridesSerializer
 
 
 User = get_user_model()
@@ -107,6 +114,83 @@ class DiskPolicySerializerTests(SimpleTestCase):
         self.assertEqual(serializer.validated_data.get("disk_layout_mode"), "concat")
 
 
+class OpenStackEndpointNormalizationTests(SimpleTestCase):
+    def test_normalize_unversioned_image_endpoint_override(self):
+        self.assertEqual(
+            _normalize_image_endpoint_override("http://192.168.72.169/image"),
+            "http://192.168.72.169/image/v2",
+        )
+
+    def test_keep_versioned_image_endpoint_override(self):
+        self.assertEqual(
+            _normalize_image_endpoint_override("http://192.168.72.169/image/v2"),
+            "http://192.168.72.169/image/v2",
+        )
+
+    def test_auto_fix_image_endpoint_promotes_catalog_endpoint(self):
+        conn = SimpleNamespace(
+            config=SimpleNamespace(
+                config={},
+                get_endpoint=lambda service_type: None,
+            ),
+            endpoint_for=lambda service_type: "http://192.168.72.169/image",
+        )
+
+        _auto_fix_image_endpoint(conn)
+
+        self.assertEqual(
+            conn.config.config["image_endpoint_override"],
+            "http://192.168.72.169/image/v2",
+        )
+        self.assertEqual(conn.config.config["image_api_version"], "2")
+
+
+class OpenStackDeploymentHelperTests(SimpleTestCase):
+    def test_find_flavor_choice_falls_back_to_flavor_name(self):
+        flavor = SimpleNamespace(id="flavor-123", name="ds2G", vcpus=2, ram=2048)
+        conn = SimpleNamespace(
+            compute=SimpleNamespace(
+                find_flavor=lambda ref, ignore_missing=True: None,
+                flavors=lambda: [flavor],
+            )
+        )
+
+        choice = find_flavor_choice(conn, "ds2G")
+
+        self.assertIsNotNone(choice)
+        self.assertEqual(choice.id, "flavor-123")
+        self.assertEqual(choice.name, "ds2G")
+        self.assertEqual(choice.vcpus, 2)
+        self.assertEqual(choice.ram, 2048)
+
+    @patch("migrations.openstack_deployment.time.sleep")
+    def test_delete_volume_if_exists_detaches_volume_before_delete(self, sleep_mock):
+        volume = SimpleNamespace(id="vol-1")
+        attached_volume = SimpleNamespace(id="vol-1", attachments=[{"server_id": "srv-1"}])
+        detached_volume = SimpleNamespace(id="vol-1", attachments=[])
+        get_volume_mock = Mock(side_effect=[attached_volume, detached_volume])
+        delete_attachment_mock = Mock()
+        delete_volume_mock = Mock()
+
+        conn = SimpleNamespace(
+            block_storage=SimpleNamespace(
+                find_volume=lambda volume_id, ignore_missing=True: volume if volume_id == "vol-1" else None,
+                get_volume=get_volume_mock,
+                delete_volume=delete_volume_mock,
+            ),
+            compute=SimpleNamespace(
+                delete_volume_attachment=delete_attachment_mock,
+            ),
+        )
+
+        status = delete_volume_if_exists(conn, "vol-1")
+
+        self.assertEqual(status, "deleted")
+        delete_attachment_mock.assert_called_once_with("srv-1", "vol-1", ignore_missing=True)
+        delete_volume_mock.assert_called_once_with("vol-1", ignore_missing=True, force=True)
+        sleep_mock.assert_called_once()
+
+
 class EndpointAccessTests(TestCase):
     def setUp(self):
         self.client = APIClient()
@@ -131,6 +215,83 @@ class EndpointAccessTests(TestCase):
         self.assertEqual(response.data["project_id"], "proj-id")
         self.assertEqual(response.data["image_count"], 1)
         self.assertEqual(response.data["flavor_count"], 2)
+
+    @patch("migrations.views.OpenStackClient")
+    def test_openstack_health_tolerates_image_service_failure(self, client_mock):
+        instance = client_mock.return_value
+        instance.validate_connection.return_value = "proj-id"
+        instance.list_images.side_effect = OpenStackClientError("glance 500")
+        instance.list_flavors.return_value = [{"id": "flv1"}]
+        instance.list_networks.return_value = [{"id": "net1"}]
+
+        self.client.force_authenticate(self.user)
+        response = self.client.get("/api/openstack/health")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["project_id"], "proj-id")
+        self.assertIsNone(response.data["image_count"])
+        self.assertEqual(response.data["image_error"], "glance 500")
+
+    @patch("migrations.views.OpenStackClient")
+    def test_openstack_endpoint_test_tolerates_image_service_failure(self, client_mock):
+        instance = client_mock.return_value
+        instance.validate_connection.return_value = "proj-id"
+        instance.list_images.side_effect = OpenStackClientError("glance 500")
+        instance.list_flavors.return_value = [{"id": "flv1"}]
+        instance.list_networks.return_value = [{"id": "net1"}]
+
+        self.client.force_authenticate(self.user)
+        response = self.client.post(
+            "/api/openstack/endpoints/test",
+            {
+                "auth_url": "http://192.168.72.169/identity",
+                "username": "admin",
+                "password": "secret",
+                "project_name": "admin",
+                "user_domain_name": "Default",
+                "project_domain_name": "Default",
+                "region_name": "RegionOne",
+                "interface": "public",
+                "identity_api_version": "3",
+                "verify": False,
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.data["ok"])
+        self.assertIn("image service is unhealthy", response.data["message"])
+        self.assertEqual(response.data["image_error"], "glance 500")
+
+    @patch("migrations.views.OpenStackClient")
+    def test_openstack_network_create_returns_created_network(self, client_mock):
+        instance = client_mock.return_value
+        instance.create_network.return_value = {
+            "id": "net-1",
+            "name": "private-migration",
+            "subnets": [{"id": "subnet-1", "cidr": "192.168.100.0/24"}],
+        }
+        instance.list_networks_detail.return_value = [
+            {
+                "id": "net-1",
+                "name": "private-migration",
+                "subnets": [{"id": "subnet-1", "cidr": "192.168.100.0/24"}],
+            }
+        ]
+
+        self.client.force_authenticate(self.user)
+        response = self.client.post(
+            "/api/openstack/networks/create",
+            {
+                "name": "private-migration",
+                "cidr": "192.168.100.0/24",
+                "enable_dhcp": True,
+                "dns_nameservers": ["8.8.8.8"],
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertTrue(response.data["ok"])
+        self.assertEqual(response.data["network"]["id"], "net-1")
+        self.assertEqual(len(response.data["items"]), 1)
 
     @patch("migrations.views.ESXiVMwareClient")
     def test_regular_user_can_test_vmware_endpoint(self, vmware_mock):
@@ -372,6 +533,65 @@ class AuthAndRBACTests(TestCase):
         self.assertEqual(admin_response.data["total_migrations"], 3)
 
 
+class DiskSelectionSerializerTests(TestCase):
+    def test_selected_disk_indexes_always_include_system_disk(self):
+        vmware_session = VmwareEndpointSession.objects.create(
+            label="vmware",
+            host="1.1.1.1",
+            port=443,
+            username="root",
+            password="pw",
+            insecure=True,
+        )
+        openstack_session = OpenstackEndpointSession.objects.create(
+            label="os",
+            auth_url="http://os.example.com",
+            username="alice",
+            password="pw",
+            project_name="proj",
+            user_domain_name="Default",
+            project_domain_name="Default",
+            region_name="",
+            interface="",
+            identity_api_version="",
+            verify=False,
+            image_endpoint_override="",
+        )
+        DiscoveredVM.objects.create(
+            name="vm-selected-disks",
+            source=DiscoveredVM.Source.ESXI,
+            vmware_endpoint_session=vmware_session,
+            cpu=2,
+            ram=2048,
+            disks=[
+                {"label": "Hard disk 1", "unit_number": 0, "size_bytes": 10},
+                {"label": "Hard disk 2", "unit_number": 1, "size_bytes": 20},
+                {"label": "Hard disk 3", "unit_number": 2, "size_bytes": 30},
+            ],
+            metadata={},
+            power_state="poweredOff",
+            last_seen=timezone.now(),
+        )
+
+        serializer = CreateMigrationFromVMwareSerializer(
+            data={
+                "vmware_endpoint_session_id": vmware_session.id,
+                "openstack_endpoint_session_id": openstack_session.id,
+                "vms": [
+                    {
+                        "name": "vm-selected-disks",
+                        "source": "esxi",
+                        "overrides": {"selected_disk_indexes": [2]},
+                    }
+                ],
+            },
+            context={},
+        )
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        overrides = serializer.validated_data["vms"][0]["overrides"]
+        self.assertEqual(overrides["selected_disk_indexes"], [0, 2])
+
+
 class SessionOwnershipTests(TestCase):
     def setUp(self):
         self.client = APIClient()
@@ -491,7 +711,7 @@ class SessionOwnershipTests(TestCase):
             vmware_endpoint_session=self.vmware_user_session,
             cpu=1,
             ram=1024,
-            disks=[],
+            disks=[{"label": "Hard disk 1", "unit_number": 0, "size_bytes": 10}],
             metadata={},
             power_state="off",
             last_seen=timezone.now(),
@@ -503,10 +723,18 @@ class SessionOwnershipTests(TestCase):
             {
                 "vmware_endpoint_session_id": self.vmware_user_session.id,
                 "openstack_endpoint_session_id": self.openstack_user_session.id,
-                "vms": [{"name": "vm-owned", "source": "esxi"}],
+                "vms": [
+                    {
+                        "name": "vm-owned",
+                        "source": "esxi",
+                        "overrides": {"selected_disk_indexes": [0]},
+                    }
+                ],
             },
             format="json",
         )
         self.assertEqual(response.status_code, 201)
         self.assertEqual(MigrationJob.objects.count(), 1)
+        job = MigrationJob.objects.first()
+        self.assertEqual(job.conversion_metadata["requested_spec"]["selected_disk_indexes"], [0])
         mock_delay.assert_called_once()

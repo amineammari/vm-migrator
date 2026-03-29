@@ -21,6 +21,7 @@ from .serializers import (
     MigrationJobDetailSerializer,
     MigrationJobSummarySerializer,
     OpenstackEndpointConnectSerializer,
+    OpenstackNetworkCreateSerializer,
     VmwareEndpointConnectSerializer,
 )
 from .permissions import IsOwnerOrSuperAdmin, IsSuperAdmin
@@ -45,12 +46,12 @@ def _resolve_openstack_endpoint_session(*, user, requested_id: int | None = None
     qs = _session_queryset(user, OpenstackEndpointSession)
     if isinstance(requested_id, int):
         return qs.filter(id=requested_id).first()
-    return None
+    return qs.order_by("-created_at").first()
 
 
 def _build_openstack_client(*, endpoint_session: OpenstackEndpointSession | None = None) -> OpenStackClient:
     if endpoint_session is None:
-        raise OpenStackClientError("OpenStack endpoint session is required.")
+        return OpenStackClient()
     return OpenStackClient(auth_config=endpoint_session.to_connect_kwargs())
 
 
@@ -71,6 +72,13 @@ def _resolve_external_network_id(client: OpenStackClient) -> str | None:
 
     externals.sort(key=lambda n: (0 if str(n.get("name", "")).strip().lower() == "public" else 1, str(n.get("name", ""))))
     return str(externals[0]["id"])
+
+
+def _optional_openstack_images(client: OpenStackClient) -> tuple[list[dict[str, object]], str | None]:
+    try:
+        return client.list_images(), None
+    except OpenStackClientError as exc:
+        return [], str(exc)
 
 
 def _terraform_overrides_from_openstack_session(session: OpenstackEndpointSession) -> dict[str, object]:
@@ -115,7 +123,7 @@ def openstack_health(request):
     """Read-only OpenStack health summary for selected/latest OpenStack endpoint session."""
     requested_session_id = _parse_optional_int(request.query_params.get("openstack_endpoint_session_id"))
     endpoint_session = _resolve_openstack_endpoint_session(user=request.user, requested_id=requested_session_id)
-    if endpoint_session is None:
+    if requested_session_id is not None and endpoint_session is None:
         return Response(
             {"error": "OpenStack endpoint session is required and must belong to you."},
             status=status.HTTP_400_BAD_REQUEST,
@@ -123,15 +131,16 @@ def openstack_health(request):
     try:
         client = _build_openstack_client(endpoint_session=endpoint_session)
         project_id = client.validate_connection()
-        images = client.list_images()
+        images, image_error = _optional_openstack_images(client)
         flavors = client.list_flavors()
         networks = client.list_networks()
         return Response(
             {
                 "project_id": project_id,
-                "image_count": len(images),
+                "image_count": len(images) if image_error is None else None,
                 "flavor_count": len(flavors),
                 "network_count": len(networks),
+                "image_error": image_error,
                 "openstack_endpoint_session_id": endpoint_session.id if endpoint_session else None,
             },
             status=status.HTTP_200_OK,
@@ -146,16 +155,18 @@ def openstack_images(request):
     """Read-only list of OpenStack images for selected/latest OpenStack endpoint session."""
     requested_session_id = _parse_optional_int(request.query_params.get("openstack_endpoint_session_id"))
     endpoint_session = _resolve_openstack_endpoint_session(user=request.user, requested_id=requested_session_id)
-    if endpoint_session is None:
+    if requested_session_id is not None and endpoint_session is None:
         return Response(
             {"error": "OpenStack endpoint session is required and must belong to you."},
             status=status.HTTP_400_BAD_REQUEST,
         )
     try:
         client = _build_openstack_client(endpoint_session=endpoint_session)
+        images, image_error = _optional_openstack_images(client)
         return Response(
             {
-                "items": client.list_images(),
+                "items": images,
+                "image_error": image_error,
                 "openstack_endpoint_session_id": endpoint_session.id if endpoint_session else None,
             },
             status=status.HTTP_200_OK,
@@ -170,7 +181,7 @@ def openstack_flavors(request):
     """Read-only list of OpenStack flavors for selected/latest OpenStack endpoint session."""
     requested_session_id = _parse_optional_int(request.query_params.get("openstack_endpoint_session_id"))
     endpoint_session = _resolve_openstack_endpoint_session(user=request.user, requested_id=requested_session_id)
-    if endpoint_session is None:
+    if requested_session_id is not None and endpoint_session is None:
         return Response(
             {"error": "OpenStack endpoint session is required and must belong to you."},
             status=status.HTTP_400_BAD_REQUEST,
@@ -194,7 +205,7 @@ def openstack_networks(request):
     """Read-only list of OpenStack networks for selected/latest OpenStack endpoint session."""
     requested_session_id = _parse_optional_int(request.query_params.get("openstack_endpoint_session_id"))
     endpoint_session = _resolve_openstack_endpoint_session(user=request.user, requested_id=requested_session_id)
-    if endpoint_session is None:
+    if requested_session_id is not None and endpoint_session is None:
         return Response(
             {"error": "OpenStack endpoint session is required and must belong to you."},
             status=status.HTTP_400_BAD_REQUEST,
@@ -210,6 +221,48 @@ def openstack_networks(request):
         )
     except OpenStackClientError as exc:
         return Response({"error": str(exc)}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def openstack_network_create(request):
+    serializer = OpenstackNetworkCreateSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+    payload = serializer.validated_data
+
+    requested_session_id = payload.get("openstack_endpoint_session_id")
+    endpoint_session = _resolve_openstack_endpoint_session(user=request.user, requested_id=requested_session_id)
+    if requested_session_id is not None and endpoint_session is None:
+        return Response(
+            {"error": "OpenStack endpoint session is required and must belong to you."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    try:
+        client = _build_openstack_client(endpoint_session=endpoint_session)
+        created = client.create_network(
+            name=payload["name"],
+            subnet_name=payload.get("subnet_name", ""),
+            cidr=payload["cidr"],
+            gateway_ip=payload.get("gateway_ip") or None,
+            enable_dhcp=payload.get("enable_dhcp", True),
+            allocation_pool_start=payload.get("allocation_pool_start") or None,
+            allocation_pool_end=payload.get("allocation_pool_end") or None,
+            dns_nameservers=payload.get("dns_nameservers", []),
+        )
+        networks = client.list_networks_detail()
+        return Response(
+            {
+                "ok": True,
+                "message": f"Network '{payload['name']}' created successfully.",
+                "network": created,
+                "items": networks,
+                "openstack_endpoint_session_id": endpoint_session.id if endpoint_session else None,
+            },
+            status=status.HTTP_201_CREATED,
+        )
+    except OpenStackClientError as exc:
+        return Response({"ok": False, "message": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
 
 @api_view(["POST"])
@@ -393,17 +446,21 @@ def openstack_endpoint_test(request):
     try:
         client = OpenStackClient(auth_config=connect_kwargs)
         project_id = client.validate_connection()
-        images = client.list_images()
+        images, image_error = _optional_openstack_images(client)
         flavors = client.list_flavors()
         networks = client.list_networks()
+        message = "Connection successful."
+        if image_error:
+            message = f"Connection successful, but the OpenStack image service is unhealthy: {image_error}"
         return Response(
             {
                 "ok": True,
-                "message": "Connection successful.",
+                "message": message,
                 "project_id": project_id,
-                "image_count": len(images),
+                "image_count": len(images) if image_error is None else None,
                 "flavor_count": len(flavors),
                 "network_count": len(networks),
+                "image_error": image_error,
             },
             status=status.HTTP_200_OK,
         )
@@ -439,7 +496,7 @@ def openstack_endpoint_connect(request):
     try:
         client = OpenStackClient(auth_config=session.to_connect_kwargs())
         project_id = client.validate_connection()
-        images = client.list_images()
+        images, image_error = _optional_openstack_images(client)
         flavors = client.list_flavors()
         networks = client.list_networks_detail()
     except OpenStackClientError as exc:
@@ -449,9 +506,17 @@ def openstack_endpoint_connect(request):
         session.save(update_fields=["last_test_status", "last_test_message", "last_test_at", "updated_at"])
         return Response({"ok": False, "message": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
+    message = "Connection successful."
+    if image_error:
+        message = f"Connection successful, but the OpenStack image service is unhealthy: {image_error}"
+    session.last_test_message = message
+    session.last_test_at = timezone.now()
+    session.save(update_fields=["last_test_message", "last_test_at", "updated_at"])
+
     return Response(
         {
             "ok": True,
+            "message": message,
             "openstack_endpoint_session": {
                 "id": session.id,
                 "label": session.label,
@@ -465,6 +530,7 @@ def openstack_endpoint_connect(request):
             },
             "project_id": project_id,
             "images": images,
+            "image_error": image_error,
             "flavors": flavors,
             "networks": networks,
         },
@@ -688,9 +754,11 @@ def create_migrations_from_vmware(request):
                 )
 
                 queued_job_ids.append(job.id)
-            transaction.on_commit(lambda: [start_migration.delay(queued_job_id) for queued_job_id in queued_job_ids])
     except Exception as exc:
         raise APIException(f"Failed to create migration jobs: {exc}") from exc
+
+    for queued_job_id in queued_job_ids:
+        start_migration.delay(queued_job_id)
 
     return Response(
         {

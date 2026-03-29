@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from ipaddress import ip_address, ip_network
 from typing import Optional
 
 from django.contrib.auth import get_user_model
@@ -19,6 +20,35 @@ def _session_for_user(model_cls, session_id: int, user) -> Optional[object]:
     return qs.first()
 
 
+def _guess_system_disk_index(discovered_vm: DiscoveredVM) -> int:
+    disks = discovered_vm.disks if isinstance(discovered_vm.disks, list) else []
+    if not disks:
+        return 0
+
+    best_index = 0
+    best_score = -1
+    for idx, disk in enumerate(disks):
+        score = 10 if idx == 0 else 0
+        if isinstance(disk, dict):
+            label = str(disk.get("label", "") or "").strip().lower()
+            filename = str(disk.get("filename", "") or disk.get("path", "") or "").strip().lower()
+            unit_number = disk.get("unit_number")
+
+            if unit_number == 0:
+                score += 100
+            if label in {"hard disk 1", "disk 1", "boot disk"}:
+                score += 80
+            elif "hard disk 1" in label:
+                score += 40
+            if filename.endswith(".vmdk") or filename.endswith(".qcow2") or filename.endswith("-flat.vmdk"):
+                score += 1
+
+        if score > best_score:
+            best_score = score
+            best_index = idx
+    return best_index
+
+
 class NetworkOverrideSerializer(serializers.Serializer):
     network_id = serializers.CharField(max_length=255, required=False, allow_blank=True)
     network_name = serializers.CharField(max_length=255, required=False, allow_blank=True)
@@ -35,6 +65,11 @@ class VMOverridesSerializer(serializers.Serializer):
         allow_empty=True,
     )
     network = NetworkOverrideSerializer(required=False)
+    selected_disk_indexes = serializers.ListField(
+        required=False,
+        child=serializers.IntegerField(min_value=0),
+        allow_empty=False,
+    )
     # Backward-compatible flag. When true, it maps to disk_layout_mode=concat.
     disk_merge = serializers.BooleanField(required=False, default=False)
     disk_layout_mode = serializers.CharField(required=False, allow_blank=True)
@@ -130,6 +165,7 @@ class CreateMigrationFromVMwareSerializer(serializers.Serializer):
             network = override_payload.get("network")
             disk_layout_mode = override_payload.get("disk_layout_mode")
             disk_merge = override_payload.get("disk_merge")
+            selected_disk_indexes = override_payload.get("selected_disk_indexes")
 
             if isinstance(flavor_id, str) and flavor_id.strip():
                 cleaned["flavor_id"] = flavor_id.strip()
@@ -143,6 +179,23 @@ class CreateMigrationFromVMwareSerializer(serializers.Serializer):
                 cleaned["disk_layout_mode"] = disk_layout_mode.strip()
             if isinstance(disk_merge, bool) and disk_merge:
                 cleaned["disk_merge"] = True
+            if isinstance(selected_disk_indexes, list):
+                vm = discovered_vm_map.get((item["name"], item["source"]))
+                valid_indexes = sorted(
+                    {
+                        int(index)
+                        for index in selected_disk_indexes
+                        if isinstance(index, int)
+                        and vm is not None
+                        and 0 <= int(index) < len(vm.disks if isinstance(vm.disks, list) else [])
+                    }
+                )
+                if vm is not None:
+                    system_disk_index = _guess_system_disk_index(vm)
+                    if system_disk_index not in valid_indexes:
+                        valid_indexes.insert(0, system_disk_index)
+                if valid_indexes:
+                    cleaned["selected_disk_indexes"] = valid_indexes
             if isinstance(network, dict):
                 network_id = network.get("network_id")
                 network_name = network.get("network_name")
@@ -293,6 +346,79 @@ class OpenstackEndpointConnectSerializer(serializers.Serializer):
     identity_api_version = serializers.CharField(max_length=32, required=False, allow_blank=True, default="")
     verify = serializers.BooleanField(required=False, default=False)
     image_endpoint_override = serializers.CharField(max_length=512, required=False, allow_blank=True, default="")
+
+
+class OpenstackNetworkCreateSerializer(serializers.Serializer):
+    openstack_endpoint_session_id = serializers.IntegerField(min_value=1, required=False)
+    name = serializers.CharField(max_length=255)
+    subnet_name = serializers.CharField(max_length=255, required=False, allow_blank=True, default="")
+    cidr = serializers.CharField(max_length=64)
+    gateway_ip = serializers.CharField(max_length=64, required=False, allow_blank=True, default="")
+    enable_dhcp = serializers.BooleanField(required=False, default=True)
+    allocation_pool_start = serializers.CharField(max_length=64, required=False, allow_blank=True, default="")
+    allocation_pool_end = serializers.CharField(max_length=64, required=False, allow_blank=True, default="")
+    dns_nameservers = serializers.ListField(
+        required=False,
+        allow_empty=True,
+        child=serializers.CharField(max_length=64),
+        default=list,
+    )
+
+    def validate(self, attrs):
+        try:
+            network = ip_network(str(attrs["cidr"]).strip(), strict=False)
+        except ValueError as exc:
+            raise serializers.ValidationError({"cidr": f"Invalid CIDR: {exc}"}) from exc
+
+        gateway_ip = str(attrs.get("gateway_ip", "") or "").strip()
+        if gateway_ip:
+            try:
+                gateway = ip_address(gateway_ip)
+            except ValueError as exc:
+                raise serializers.ValidationError({"gateway_ip": f"Invalid gateway IP: {exc}"}) from exc
+            if gateway not in network:
+                raise serializers.ValidationError({"gateway_ip": "Gateway IP must belong to the subnet CIDR."})
+            attrs["gateway_ip"] = gateway_ip
+        else:
+            attrs["gateway_ip"] = ""
+
+        pool_start = str(attrs.get("allocation_pool_start", "") or "").strip()
+        pool_end = str(attrs.get("allocation_pool_end", "") or "").strip()
+        if bool(pool_start) != bool(pool_end):
+            raise serializers.ValidationError(
+                {"allocation_pool_start": "Provide both allocation pool start and end, or leave both empty."}
+            )
+        if pool_start and pool_end:
+            try:
+                start_ip = ip_address(pool_start)
+                end_ip = ip_address(pool_end)
+            except ValueError as exc:
+                raise serializers.ValidationError({"allocation_pool_start": f"Invalid allocation pool IP: {exc}"}) from exc
+            if start_ip not in network or end_ip not in network:
+                raise serializers.ValidationError({"allocation_pool_start": "Allocation pool must stay inside the subnet CIDR."})
+            if start_ip > end_ip:
+                raise serializers.ValidationError({"allocation_pool_start": "Allocation pool start must be <= end."})
+            attrs["allocation_pool_start"] = pool_start
+            attrs["allocation_pool_end"] = pool_end
+        else:
+            attrs["allocation_pool_start"] = ""
+            attrs["allocation_pool_end"] = ""
+
+        dns_nameservers = []
+        for value in attrs.get("dns_nameservers", []):
+            dns_value = str(value or "").strip()
+            if not dns_value:
+                continue
+            try:
+                ip_address(dns_value)
+            except ValueError as exc:
+                raise serializers.ValidationError({"dns_nameservers": f"Invalid DNS nameserver '{dns_value}': {exc}"}) from exc
+            dns_nameservers.append(dns_value)
+        attrs["dns_nameservers"] = dns_nameservers
+        attrs["subnet_name"] = str(attrs.get("subnet_name", "") or "").strip()
+        attrs["name"] = str(attrs["name"]).strip()
+        attrs["cidr"] = str(attrs["cidr"]).strip()
+        return attrs
 
 
 class MigrationJobSummarySerializer(serializers.ModelSerializer):

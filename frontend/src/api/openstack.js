@@ -20,6 +20,13 @@ export async function fetchOpenStackNetworks(openstackEndpointSessionId = null) 
   return data?.items || []
 }
 
+export async function createOpenStackNetwork(payload) {
+  return apiFetch('/api/openstack/networks/create', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+}
+
 export async function testOpenstackEndpoint(payload) {
   return apiFetch('/api/openstack/endpoints/test', {
     method: 'POST',

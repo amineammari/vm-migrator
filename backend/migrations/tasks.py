@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import time
 import xml.etree.ElementTree as ET
+from math import ceil
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -47,11 +48,13 @@ from .openstack_deployment import (
     connect_openstack,
     delete_image_if_exists,
     delete_server_if_exists,
+    delete_volume_by_name_if_exists,
     delete_volume_if_exists,
     ensure_server_booted_from_volume,
     ensure_empty_volume,
     ensure_uploaded_image,
     ensure_volume_from_image,
+    find_flavor_choice,
     get_flavor_choice_by_id,
     map_vmware_to_flavor,
     select_default_network,
@@ -449,6 +452,121 @@ def _order_qcow2_paths_for_boot(paths: list[Path], vm_name: str) -> tuple[list[P
             break
 
     return paths, primary, primary_index, inspected
+
+
+def _guess_system_disk_index_from_source(discovered_vm: DiscoveredVM) -> int:
+    disks = discovered_vm.disks if isinstance(discovered_vm.disks, list) else []
+    if not disks:
+        return 0
+
+    best_index = 0
+    best_score = -1
+    for idx, disk in enumerate(disks):
+        score = 10 if idx == 0 else 0
+        if isinstance(disk, dict):
+            label = str(disk.get("label", "") or "").strip().lower()
+            filename = str(disk.get("filename", "") or disk.get("path", "") or "").strip().lower()
+            unit_number = disk.get("unit_number")
+
+            if unit_number == 0:
+                score += 100
+            if label in {"hard disk 1", "disk 1", "boot disk"}:
+                score += 80
+            elif "hard disk 1" in label:
+                score += 40
+            if filename.endswith(".vmdk") or filename.endswith(".qcow2") or filename.endswith("-flat.vmdk"):
+                score += 1
+
+        if score > best_score:
+            best_score = score
+            best_index = idx
+    return best_index
+
+
+def _resolve_selected_disk_indexes(discovered_vm: DiscoveredVM, requested_indexes: Any) -> list[int]:
+    disks = discovered_vm.disks if isinstance(discovered_vm.disks, list) else []
+    if not disks:
+        return [0]
+
+    valid_indexes = list(range(len(disks)))
+    if isinstance(requested_indexes, list):
+        selected = sorted(
+            {
+                int(index)
+                for index in requested_indexes
+                if isinstance(index, int) and 0 <= int(index) < len(disks)
+            }
+        )
+    else:
+        selected = list(valid_indexes)
+
+    system_disk_index = _guess_system_disk_index_from_source(discovered_vm)
+    if system_disk_index not in selected:
+        selected.insert(0, system_disk_index)
+    return sorted(set(selected))
+
+
+def _filter_source_disks(discovered_vm: DiscoveredVM, selected_disk_indexes: list[int]) -> DiscoveredVM:
+    disks = discovered_vm.disks if isinstance(discovered_vm.disks, list) else []
+    if not disks:
+        return discovered_vm
+
+    filtered_disks = [
+        disk
+        for idx, disk in enumerate(disks)
+        if idx in set(selected_disk_indexes)
+    ]
+    filtered_vm = DiscoveredVM(
+        name=discovered_vm.name,
+        vmware_endpoint_session=discovered_vm.vmware_endpoint_session,
+        source=discovered_vm.source,
+        cpu=discovered_vm.cpu,
+        ram=discovered_vm.ram,
+        disks=filtered_disks,
+        metadata=discovered_vm.metadata,
+        power_state=discovered_vm.power_state,
+        last_seen=discovered_vm.last_seen,
+    )
+    filtered_vm.id = discovered_vm.id
+    filtered_vm.pk = discovered_vm.pk
+    filtered_vm.vmware_endpoint_session_id = discovered_vm.vmware_endpoint_session_id
+    return filtered_vm
+
+
+def _filter_execution_to_selected_disks(
+    execution: dict[str, Any],
+    selected_disk_indexes: list[int],
+) -> dict[str, Any]:
+    output_qcow2_paths = execution.get("output_qcow2_paths")
+    if not isinstance(output_qcow2_paths, list) or not output_qcow2_paths:
+        single = execution.get("output_qcow2_path")
+        output_qcow2_paths = [single] if isinstance(single, str) and single.strip() else []
+    if not output_qcow2_paths:
+        return execution
+
+    filtered_indexes = [idx for idx in selected_disk_indexes if 0 <= idx < len(output_qcow2_paths)]
+    if not filtered_indexes:
+        filtered_indexes = [0]
+
+    filtered_paths = [str(output_qcow2_paths[idx]) for idx in filtered_indexes]
+    execution["output_qcow2_paths"] = filtered_paths
+    execution["output_qcow2_path"] = filtered_paths[0]
+    execution["primary_disk_index"] = 0
+    execution["disk_count"] = len(filtered_paths)
+
+    if isinstance(execution.get("disk_analysis"), list):
+        execution["disk_analysis"] = [
+            {**item, "selected_for_migration": idx in set(filtered_indexes)}
+            for idx, item in enumerate(execution["disk_analysis"])
+            if idx in set(filtered_indexes)
+        ]
+
+    if isinstance(execution.get("disk_sizes"), dict):
+        execution["disk_sizes"] = {
+            str(path): execution["disk_sizes"].get(str(path), execution["disk_sizes"].get(path, 0))
+            for path in filtered_paths
+        }
+    return execution
 
 
 def _apply_disk_layout_mode(
@@ -975,7 +1093,14 @@ def _rollback_openstack_resources(job: MigrationJob, actions: list[dict[str, Any
         volume_ids.extend([str(v) for v in os_meta.get("extra_volume_ids") if isinstance(v, str) and v.strip()])
     volume_ids = list(dict.fromkeys(volume_ids))
 
-    if not image_ids and not server_id and not volume_ids:
+    planned_volume_names: list[str] = []
+    if isinstance(os_meta.get("planned_volume_names"), list):
+        planned_volume_names.extend(
+            [str(v) for v in os_meta.get("planned_volume_names") if isinstance(v, str) and v.strip()]
+        )
+    planned_volume_names = list(dict.fromkeys(planned_volume_names))
+
+    if not image_ids and not server_id and not volume_ids and not planned_volume_names:
         return
 
     selected_openstack_endpoint_session_id = metadata.get("selected_openstack_endpoint_session_id")
@@ -1019,6 +1144,21 @@ def _rollback_openstack_resources(job: MigrationJob, actions: list[dict[str, Any
             actions.append({
                 "action": "delete_volume",
                 "volume_id": volume_id,
+                "status": "error",
+                "error": str(exc),
+            })
+
+    for volume_name in planned_volume_names:
+        try:
+            status, deleted_volume_id = delete_volume_by_name_if_exists(conn, volume_name)
+            action = {"action": "delete_volume_by_name", "volume_name": volume_name, "status": status}
+            if deleted_volume_id:
+                action["volume_id"] = deleted_volume_id
+            actions.append(action)
+        except Exception as exc:
+            actions.append({
+                "action": "delete_volume_by_name",
+                "volume_name": volume_name,
                 "status": "error",
                 "error": str(exc),
             })
@@ -1175,6 +1315,7 @@ def _effective_target_spec(job: MigrationJob, discovered_vm: DiscoveredVM) -> di
     extra_disks_gb: list[int] = []
     if isinstance(raw_extra_disks, list):
         extra_disks_gb = [int(v) for v in raw_extra_disks if isinstance(v, int) and v > 0]
+    selected_disk_indexes = _resolve_selected_disk_indexes(discovered_vm, requested.get("selected_disk_indexes"))
 
     return {
         "flavor_id": flavor_id,
@@ -1185,6 +1326,8 @@ def _effective_target_spec(job: MigrationJob, discovered_vm: DiscoveredVM) -> di
         "network_name": network_name,
         "fixed_ip": fixed_ip,
         "extra_disks_gb": extra_disks_gb,
+        "selected_disk_indexes": selected_disk_indexes,
+        "system_disk_index": selected_disk_indexes[0] if selected_disk_indexes else 0,
     }
 
 
@@ -1249,9 +1392,14 @@ def _validate_openstack_post_migration(
     server = conn.compute.get_server(server_id)
     server_status = str(getattr(server, "status", "")).upper()
     server_flavor = getattr(server, "flavor", {}) or {}
-    server_flavor_id = str(server_flavor.get("id", ""))
-    expected_flavor = conn.compute.get_flavor(expected_flavor_id)
-    actual_flavor = conn.compute.get_flavor(server_flavor_id) if server_flavor_id else None
+    server_flavor_id = str(server_flavor.get("id", "") or "")
+    server_flavor_ref = (
+        server_flavor_id
+        or str(server_flavor.get("original_name", "") or "")
+        or str(server_flavor.get("name", "") or "")
+    )
+    expected_flavor = find_flavor_choice(conn, expected_flavor_id)
+    actual_flavor = find_flavor_choice(conn, server_flavor_ref)
     server_addresses = getattr(server, "addresses", {}) or {}
 
     volume_checks: list[dict[str, Any]] = []
@@ -1283,21 +1431,29 @@ def _validate_openstack_post_migration(
         (expected_cpu is None or actual_cpu >= int(expected_cpu))
         and (expected_ram is None or actual_ram >= int(expected_ram))
     )
-    flavor_id_match = server_flavor_id == str(expected_flavor_id)
+    flavor_id_match = bool(
+        actual_flavor
+        and expected_flavor
+        and str(actual_flavor.id) == str(expected_flavor.id)
+    )
 
     checks = {
         "images": image_checks,
         "server": {
             "status": server_status,
             "flavor_id": server_flavor_id,
+            "flavor_ref": server_flavor_ref,
             "expected_flavor_id": expected_flavor_id,
             "expected_cpu": expected_cpu,
             "expected_ram": expected_ram,
+            "expected_flavor_name": getattr(expected_flavor, "name", ""),
             "expected_flavor_cpu": expected_flavor_cpu,
             "expected_flavor_ram": expected_flavor_ram,
+            "actual_flavor_name": getattr(actual_flavor, "name", ""),
             "actual_cpu": actual_cpu,
             "actual_ram": actual_ram,
             "flavor_id_match": flavor_id_match,
+            "flavor_lookup_ok": bool(actual_flavor and expected_flavor),
             "flavor_resources_ok": flavor_resources_ok,
             "addresses": server_addresses,
             "network_ok": network_ok,
@@ -1380,6 +1536,7 @@ def _run_openstack_deployment(job: MigrationJob, discovered_vm: DiscoveredVM) ->
 
     existing_image_ids = os_meta.get("image_ids") if isinstance(os_meta.get("image_ids"), list) else []
     image_ids: list[str] = []
+    image_details: list[dict[str, Any]] = []
     for idx, qcow2_path in enumerate(qcow2_paths):
         image_name = names["image_name"] if idx == 0 else f"{names['image_name']}-disk{idx}"
         existing_image_id = None
@@ -1404,6 +1561,32 @@ def _run_openstack_deployment(job: MigrationJob, discovered_vm: DiscoveredVM) ->
         os_meta["image_ids"] = list(image_ids)
         os_meta["image_name"] = names["image_name"]
         os_meta["image_names"] = [names["image_name"]] + [f"{names['image_name']}-disk{i}" for i in range(1, len(image_ids))]
+        current_image = conn.image.get_image(image_id)
+        image_size = int(getattr(current_image, "size", 0) or 0)
+        virtual_size = int(getattr(current_image, "virtual_size", 0) or 0)
+        min_disk = int(getattr(current_image, "min_disk", 0) or 0)
+        derived_size_gb = max(
+            1,
+            min_disk,
+            int(ceil(image_size / (1024 ** 3))) if image_size > 0 else 0,
+            int(ceil(virtual_size / (1024 ** 3))) if virtual_size > 0 else 0,
+        )
+        image_details.append(
+            {
+                "index": idx,
+                "image_id": image_id,
+                "image_name": image_name,
+                "status": str(getattr(current_image, "status", "") or "").lower(),
+                "disk_format": str(getattr(current_image, "disk_format", "") or "").lower(),
+                "container_format": str(getattr(current_image, "container_format", "") or "").lower(),
+                "size": image_size,
+                "virtual_size": virtual_size,
+                "min_disk": min_disk,
+                "derived_volume_size_gb": derived_size_gb,
+                "source_qcow2_path": qcow2_path,
+            }
+        )
+        os_meta["image_details"] = list(image_details)
         _persist_openstack_progress()
 
     existing_volume_ids = os_meta.get("volume_ids") if isinstance(os_meta.get("volume_ids"), list) else []
@@ -1411,14 +1594,41 @@ def _run_openstack_deployment(job: MigrationJob, discovered_vm: DiscoveredVM) ->
     converted_volume_ids: list[str] = []
     for idx, image_id in enumerate(image_ids):
         vol_name = f"{names['server_name']}-disk{idx}"
+        planned_volume_names = os_meta.get("planned_volume_names")
+        if not isinstance(planned_volume_names, list):
+            planned_volume_names = []
+        if vol_name not in planned_volume_names:
+            planned_volume_names.append(vol_name)
+        os_meta["planned_volume_names"] = planned_volume_names
+        _persist_openstack_progress()
         existing_volume_id = None
         if idx < len(existing_volume_ids) and isinstance(existing_volume_ids[idx], str):
             existing_volume_id = existing_volume_ids[idx]
+        requested_size_gb = None
+        if idx < len(image_details) and isinstance(image_details[idx], dict):
+            requested_size_gb = image_details[idx].get("derived_volume_size_gb")
+        planned_volumes = os_meta.get("planned_volumes")
+        if not isinstance(planned_volumes, list):
+            planned_volumes = []
+        planned_volume_entry = {
+            "index": idx,
+            "volume_name": vol_name,
+            "image_id": image_id,
+            "existing_volume_id": existing_volume_id,
+            "requested_size_gb": requested_size_gb,
+        }
+        if idx < len(planned_volumes):
+            planned_volumes[idx] = planned_volume_entry
+        else:
+            planned_volumes.append(planned_volume_entry)
+        os_meta["planned_volumes"] = planned_volumes
+        _persist_openstack_progress()
         volume_id = ensure_volume_from_image(
             conn,
             volume_name=vol_name,
             image_id=image_id,
             existing_volume_id=existing_volume_id,
+            size_gb=requested_size_gb if isinstance(requested_size_gb, int) and requested_size_gb > 0 else None,
             timeout_seconds=int(getattr(settings, "OPENSTACK_VERIFY_TIMEOUT", 900)),
             poll_interval_seconds=int(getattr(settings, "OPENSTACK_IMAGE_UPLOAD_POLL_INTERVAL", 5)),
             retries=int(getattr(settings, "OPENSTACK_API_RETRIES", 2)),
@@ -1502,6 +1712,13 @@ def _run_openstack_deployment(job: MigrationJob, discovered_vm: DiscoveredVM) ->
     requested_extra_disks = target_spec["extra_disks_gb"]
     for extra_idx, size_gb in enumerate(requested_extra_disks, start=1):
         vol_name = f"{names['server_name']}-extra{extra_idx}"
+        planned_volume_names = os_meta.get("planned_volume_names")
+        if not isinstance(planned_volume_names, list):
+            planned_volume_names = []
+        if vol_name not in planned_volume_names:
+            planned_volume_names.append(vol_name)
+        os_meta["planned_volume_names"] = planned_volume_names
+        _persist_openstack_progress()
         existing_extra_volume_id = None
         if (extra_idx - 1) < len(extra_volume_ids) and isinstance(extra_volume_ids[extra_idx - 1], str):
             existing_extra_volume_id = extra_volume_ids[extra_idx - 1]
@@ -1548,6 +1765,8 @@ def _run_openstack_deployment(job: MigrationJob, discovered_vm: DiscoveredVM) ->
             "image_names": [names["image_name"]] + [f"{names['image_name']}-disk{i}" for i in range(1, len(image_ids))],
             "source_qcow2_paths": qcow2_paths,
             "source_disk_count": len(qcow2_paths),
+            "selected_disk_indexes": target_spec["selected_disk_indexes"],
+            "system_disk_index": target_spec["system_disk_index"],
             "output_disk_format": output_disk_format,
             "flavor_id": flavor.id,
             "flavor_name": flavor.name,
@@ -1663,11 +1882,19 @@ def start_migration(job_id: int) -> dict[str, Any]:
         }:
             discovered_vm = _find_discovered_vm_for_job(job)
         metadata = job.conversion_metadata if isinstance(job.conversion_metadata, dict) else {}
+        target_spec = _effective_target_spec(job, discovered_vm) if discovered_vm is not None else {}
 
         def _build_plan_with_context() -> tuple[ConversionPlan, dict[str, Any], Path | None]:
             esxi_uri = None
             passfile: Path | None = None
             validation: dict[str, Any] = {"checked_paths": [], "errors": [], "skipped": False}
+            source_vm_for_plan = discovered_vm
+            if (
+                discovered_vm is not None
+                and discovered_vm.source == DiscoveredVM.Source.WORKSTATION
+                and isinstance(target_spec.get("selected_disk_indexes"), list)
+            ):
+                source_vm_for_plan = _filter_source_disks(discovered_vm, target_spec["selected_disk_indexes"])
 
             if discovered_vm.source == DiscoveredVM.Source.ESXI:
                 if (discovered_vm.power_state or "").lower() not in {"poweredoff", "powered_off", "poweroff", "off"}:
@@ -1699,7 +1926,7 @@ def start_migration(job_id: int) -> dict[str, Any]:
                 validation["checked_paths"] = [{"password_file": str(passfile), "esxi_uri": esxi_uri}]
 
             plan = plan_vmware_conversion(
-                discovered_vm,
+                source_vm_for_plan,
                 output_dir=settings.MIGRATION_OUTPUT_DIR,
                 esxi_uri=esxi_uri,
                 password_file=str(passfile) if passfile else None,
@@ -1707,7 +1934,7 @@ def start_migration(job_id: int) -> dict[str, Any]:
                 vddk_libdir=os.getenv("VMWARE_VDDK_LIBDIR", "").strip() or None,
                 vddk_thumbprint=os.getenv("VMWARE_VDDK_THUMBPRINT", "").strip() or None,
             )
-            if discovered_vm.source == DiscoveredVM.Source.WORKSTATION:
+            if source_vm_for_plan.source == DiscoveredVM.Source.WORKSTATION:
                 validation = _validate_workstation_paths(plan.input_disks, plan.output_path)
                 if validation["errors"]:
                     raise ConversionPlanningError("; ".join(validation["errors"]))
@@ -1757,7 +1984,6 @@ def start_migration(job_id: int) -> dict[str, Any]:
                 job.transition(MigrationJob.Status.DISK_ANALYZING)
             job.refresh_from_db()
 
-        target_spec = _effective_target_spec(job, discovered_vm)
         if job.status == MigrationJob.Status.DISK_ANALYZING:
             conversion = metadata.get("conversion", {}) if isinstance(metadata.get("conversion"), dict) else {}
             precheck_local = (
@@ -1896,6 +2122,7 @@ def start_migration(job_id: int) -> dict[str, Any]:
                         disk_layout_mode=target_spec["disk_layout_mode"],
                         prefer_sparse_output=prefer_sparse_output,
                     )
+                exec_result = _filter_execution_to_selected_disks(exec_result, target_spec["selected_disk_indexes"])
                 metadata["conversion"]["execution"] = {"state": "succeeded", **exec_result}
 
             if bool(getattr(settings, "ENABLE_ARTIFACT_BACKUP", False)) and not already_converted:
@@ -1954,6 +2181,10 @@ def start_migration(job_id: int) -> dict[str, Any]:
         if job.status == MigrationJob.Status.BLOCK_VALIDATING:
             conversion = metadata.get("conversion", {}) if isinstance(metadata.get("conversion"), dict) else {}
             execution = conversion.get("execution", {}) if isinstance(conversion.get("execution"), dict) else {}
+            if isinstance(execution, dict):
+                execution = _filter_execution_to_selected_disks(execution, target_spec["selected_disk_indexes"])
+                conversion["execution"] = execution
+                metadata["conversion"] = conversion
             output_paths = execution.get("output_qcow2_paths")
             if not isinstance(output_paths, list) or not output_paths:
                 single = execution.get("output_qcow2_path")

@@ -12,6 +12,7 @@ import {
 import {
   closeOpenstackEndpointSession,
   connectOpenstackEndpoint,
+  createOpenStackNetwork,
   fetchOpenStackFlavors,
   fetchOpenStackNetworks,
   fetchOpenstackEndpointSession,
@@ -70,6 +71,19 @@ function VMwareInventoryPage() {
   const [openstackConnecting, setOpenstackConnecting] = useState(false)
   const [openstackTestPassed, setOpenstackTestPassed] = useState(false)
   const [openstackTestMessage, setOpenstackTestMessage] = useState('')
+  const [networkCreateForm, setNetworkCreateForm] = useState({
+    name: '',
+    subnet_name: '',
+    cidr: '192.168.100.0/24',
+    gateway_ip: '',
+    allocation_pool_start: '',
+    allocation_pool_end: '',
+    dns_nameservers: '8.8.8.8, 1.1.1.1',
+    enable_dhcp: true,
+  })
+  const [networkCreateBusy, setNetworkCreateBusy] = useState(false)
+  const [networkCreateMessage, setNetworkCreateMessage] = useState('')
+  const [networkCreateError, setNetworkCreateError] = useState('')
 
   const selectedVMs = useMemo(
     () => vms.filter((vm) => selectedKeys.has(makeKey(vm))),
@@ -351,6 +365,9 @@ function VMwareInventoryPage() {
       setShowOpenstackModal(false)
       setOpenstackTestPassed(false)
       setOpenstackTestMessage('')
+      if (res?.message && res.message !== 'Connection successful.') {
+        setOpenstackError(res.message)
+      }
     } catch (err) {
       setOpenstackError(err.message || 'Connexion OpenStack impossible.')
     } finally {
@@ -370,6 +387,46 @@ function VMwareInventoryPage() {
       setActiveOpenstackEndpoint(null)
       setFlavors([])
       setNetworks([])
+      setNetworkCreateMessage('')
+      setNetworkCreateError('')
+    }
+  }
+
+  async function handleCreateNetwork() {
+    if (!activeOpenstackEndpoint?.id) {
+      setNetworkCreateError('Connect an OpenStack endpoint first.')
+      return
+    }
+
+    setNetworkCreateBusy(true)
+    setNetworkCreateMessage('')
+    setNetworkCreateError('')
+    try {
+      const res = await createOpenStackNetwork({
+        openstack_endpoint_session_id: activeOpenstackEndpoint.id,
+        name: networkCreateForm.name,
+        subnet_name: networkCreateForm.subnet_name,
+        cidr: networkCreateForm.cidr,
+        gateway_ip: networkCreateForm.gateway_ip,
+        allocation_pool_start: networkCreateForm.allocation_pool_start,
+        allocation_pool_end: networkCreateForm.allocation_pool_end,
+        enable_dhcp: networkCreateForm.enable_dhcp,
+        dns_nameservers: String(networkCreateForm.dns_nameservers || '')
+          .split(',')
+          .map((item) => item.trim())
+          .filter(Boolean),
+      })
+      setNetworks(Array.isArray(res?.items) ? res.items : [])
+      setNetworkCreateMessage(res?.message || 'Network created successfully.')
+      setNetworkCreateForm((current) => ({
+        ...current,
+        name: '',
+        subnet_name: '',
+      }))
+    } catch (err) {
+      setNetworkCreateError(err.message || 'Failed to create OpenStack network.')
+    } finally {
+      setNetworkCreateBusy(false)
     }
   }
 
@@ -422,6 +479,108 @@ function VMwareInventoryPage() {
           Created: {result.created_jobs?.length || 0}, Skipped: {result.skipped_jobs?.length || 0}
         </div>
       )}
+
+      <div className="panel">
+        {!activeOpenstackEndpoint ? (
+          <PanelState title="No OpenStack connection" message="Connect OpenStack to create a network and subnet for migrated VMs." />
+        ) : (
+          <>
+            <div className="toolbar">
+              <p>Create an OpenStack network and subnet in the active project.</p>
+              <button
+                className="secondary-btn"
+                onClick={async () => {
+                  setNetworkCreateError('')
+                  const refreshed = await fetchOpenStackNetworks(activeOpenstackEndpoint.id)
+                  setNetworks(refreshed)
+                }}
+                disabled={networkCreateBusy}
+              >
+                Refresh Networks
+              </button>
+            </div>
+            <div className="spec-form-grid">
+              <article className="spec-card">
+                <h4>New Network</h4>
+                <p>The subnet is created together with the network so it can be selected right away during migration.</p>
+                <div className="spec-fields">
+                  <label>
+                    <span>Network name</span>
+                    <input
+                      value={networkCreateForm.name}
+                      onChange={(e) => setNetworkCreateForm((v) => ({ ...v, name: e.target.value }))}
+                      placeholder="private-migration"
+                    />
+                  </label>
+                  <label>
+                    <span>Subnet name</span>
+                    <input
+                      value={networkCreateForm.subnet_name}
+                      onChange={(e) => setNetworkCreateForm((v) => ({ ...v, subnet_name: e.target.value }))}
+                      placeholder="private-migration-subnet"
+                    />
+                  </label>
+                  <label>
+                    <span>CIDR</span>
+                    <input
+                      value={networkCreateForm.cidr}
+                      onChange={(e) => setNetworkCreateForm((v) => ({ ...v, cidr: e.target.value }))}
+                      placeholder="192.168.100.0/24"
+                    />
+                  </label>
+                  <label>
+                    <span>Gateway IP</span>
+                    <input
+                      value={networkCreateForm.gateway_ip}
+                      onChange={(e) => setNetworkCreateForm((v) => ({ ...v, gateway_ip: e.target.value }))}
+                      placeholder="192.168.100.1"
+                    />
+                  </label>
+                  <label>
+                    <span>Allocation start</span>
+                    <input
+                      value={networkCreateForm.allocation_pool_start}
+                      onChange={(e) => setNetworkCreateForm((v) => ({ ...v, allocation_pool_start: e.target.value }))}
+                      placeholder="192.168.100.50"
+                    />
+                  </label>
+                  <label>
+                    <span>Allocation end</span>
+                    <input
+                      value={networkCreateForm.allocation_pool_end}
+                      onChange={(e) => setNetworkCreateForm((v) => ({ ...v, allocation_pool_end: e.target.value }))}
+                      placeholder="192.168.100.200"
+                    />
+                  </label>
+                  <label className="span-2">
+                    <span>DNS nameservers</span>
+                    <input
+                      value={networkCreateForm.dns_nameservers}
+                      onChange={(e) => setNetworkCreateForm((v) => ({ ...v, dns_nameservers: e.target.value }))}
+                      placeholder="8.8.8.8, 1.1.1.1"
+                    />
+                  </label>
+                  <label className="checkbox-line span-2">
+                    <input
+                      type="checkbox"
+                      checked={networkCreateForm.enable_dhcp}
+                      onChange={(e) => setNetworkCreateForm((v) => ({ ...v, enable_dhcp: e.target.checked }))}
+                    />
+                    <span>Enable DHCP on subnet</span>
+                  </label>
+                </div>
+                <div className="modal-actions">
+                  <button className="primary-btn" onClick={handleCreateNetwork} disabled={networkCreateBusy}>
+                    {networkCreateBusy ? 'Creating...' : 'Create Network'}
+                  </button>
+                </div>
+                {networkCreateError && <div className="alert error">{networkCreateError}</div>}
+                {networkCreateMessage && <div className="alert success">{networkCreateMessage}</div>}
+              </article>
+            </div>
+          </>
+        )}
+      </div>
 
       <div className="panel">
         {!activeVmwareEndpoint ? (
@@ -545,6 +704,39 @@ function VMwareInventoryPage() {
                             placeholder="20, 50"
                           />
                         </label>
+                        <div className="span-2">
+                          <span>Disks to migrate</span>
+                          <div className="subtable">
+                            {(Array.isArray(vm?.disks) ? vm.disks : []).map((disk, diskIndex) => {
+                              const systemDiskIndex = inferSystemDiskIndex(vm)
+                              const isRequired = diskIndex === systemDiskIndex
+                              const selectedDiskIndexes = Array.isArray(spec?.selected_disk_indexes)
+                                ? spec.selected_disk_indexes
+                                : []
+                              const checked = selectedDiskIndexes.includes(diskIndex)
+                              return (
+                                <label
+                                  key={`${key}-disk-${diskIndex}`}
+                                  className={`subrow ${isRequired ? 'muted' : ''}`}
+                                >
+                                  <span>
+                                    <input
+                                      type="checkbox"
+                                      checked={checked}
+                                      disabled={isRequired}
+                                      onChange={() =>
+                                        updateSpec(vm, 'selected_disk_indexes', toggleSelectedDisk(spec, diskIndex, systemDiskIndex))
+                                      }
+                                    />{' '}
+                                    {disk?.label || `Disk ${diskIndex + 1}`}
+                                    {isRequired ? ' (systeme obligatoire)' : ''}
+                                  </span>
+                                  <strong>{formatBytes(disk?.size_bytes)}</strong>
+                                </label>
+                              )
+                            })}
+                          </div>
+                        </div>
                       </div>
                     </article>
                   )
@@ -784,6 +976,8 @@ function makeKey(vm) {
 
 function buildDefaultSpec(vm) {
   const metadata = vm?.metadata || {}
+  const systemDiskIndex = inferSystemDiskIndex(vm)
+  const allDiskIndexes = Array.isArray(vm?.disks) ? vm.disks.map((_, index) => index) : [systemDiskIndex]
   return {
     flavor_id: '',
     cpu: vm?.cpu ?? '',
@@ -792,6 +986,8 @@ function buildDefaultSpec(vm) {
     network_name: inferNetworkName(metadata),
     fixed_ip: inferFixedIp(metadata),
     extra_disks_gb: '',
+    selected_disk_indexes: allDiskIndexes,
+    system_disk_index: systemDiskIndex,
   }
 }
 
@@ -810,6 +1006,12 @@ function buildOverrides(spec) {
 
   const extraDisks = parseDiskList(spec?.extra_disks_gb)
   if (extraDisks.length) overrides.extra_disks_gb = extraDisks
+  if (Array.isArray(spec?.selected_disk_indexes) && spec.selected_disk_indexes.length) {
+    overrides.selected_disk_indexes = Array.from(new Set(spec.selected_disk_indexes))
+      .map((value) => Number.parseInt(String(value), 10))
+      .filter((value) => Number.isInteger(value) && value >= 0)
+      .sort((a, b) => a - b)
+  }
 
   const network = {}
   if (typeof spec?.network_id === 'string' && spec.network_id.trim()) {
@@ -870,6 +1072,46 @@ function inferFixedIp(metadata) {
     if (typeof candidate === 'string' && candidate.trim()) return candidate.trim()
   }
   return ''
+}
+
+function inferSystemDiskIndex(vm) {
+  const disks = Array.isArray(vm?.disks) ? vm.disks : []
+  if (!disks.length) return 0
+
+  let bestIndex = 0
+  let bestScore = -1
+  disks.forEach((disk, index) => {
+    const label = String(disk?.label || '').trim().toLowerCase()
+    const filename = String(disk?.filename || disk?.path || '').trim().toLowerCase()
+    const unitNumber = disk?.unit_number
+    let score = index === 0 ? 10 : 0
+
+    if (unitNumber === 0) score += 100
+    if (label === 'hard disk 1' || label === 'disk 1' || label === 'boot disk') score += 80
+    else if (label.includes('hard disk 1')) score += 40
+    if (filename.endsWith('.vmdk') || filename.endsWith('.qcow2') || filename.endsWith('-flat.vmdk')) score += 1
+
+    if (score > bestScore) {
+      bestScore = score
+      bestIndex = index
+    }
+  })
+
+  return bestIndex
+}
+
+function toggleSelectedDisk(spec, diskIndex, requiredIndex) {
+  const current = Array.isArray(spec?.selected_disk_indexes) ? spec.selected_disk_indexes : []
+  const next = new Set(current)
+  if (diskIndex === requiredIndex) {
+    next.add(requiredIndex)
+  } else if (next.has(diskIndex)) {
+    next.delete(diskIndex)
+  } else {
+    next.add(diskIndex)
+  }
+  next.add(requiredIndex)
+  return Array.from(next).sort((a, b) => a - b)
 }
 
 function formatNetworkLabel(network) {

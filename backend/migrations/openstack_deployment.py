@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from math import ceil
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlsplit, urlunsplit
 
 import openstack
 from keystoneauth1 import exceptions as ks_exceptions
@@ -19,6 +20,9 @@ from openstack.connection import Connection
 
 class OpenStackDeploymentError(Exception):
     """Raised when OpenStack deployment steps fail."""
+
+
+_VERSIONED_IMAGE_PATH_RE = re.compile(r"/v\d+(?:\.\d+)?/?$")
 
 
 @dataclass
@@ -82,23 +86,75 @@ def _connect_kwargs_from_env() -> dict[str, Any] | None:
 
     image_endpoint_override = os.environ.get("OPENSTACK_IMAGE_ENDPOINT_OVERRIDE", "").strip() or None
     if image_endpoint_override:
-        kwargs["image_endpoint_override"] = image_endpoint_override
+        kwargs["image_endpoint_override"] = _normalize_image_endpoint_override(image_endpoint_override)
 
     return kwargs
+
+
+def _normalize_image_endpoint_override(endpoint: str | None) -> str | None:
+    """Ensure Glance endpoint overrides point at a concrete API version."""
+    if not isinstance(endpoint, str):
+        return None
+
+    value = endpoint.strip()
+    if not value:
+        return None
+
+    parsed = urlsplit(value)
+    path = (parsed.path or "").rstrip("/")
+    if _VERSIONED_IMAGE_PATH_RE.search(path):
+        normalized_path = path
+    else:
+        normalized_path = f"{path}/v2" if path else "/v2"
+
+    return urlunsplit(parsed._replace(path=normalized_path))
+
+
+def _apply_image_endpoint_override(conn: Connection, endpoint: str | None) -> None:
+    normalized = _normalize_image_endpoint_override(endpoint)
+    if not normalized:
+        return
+    conn.config.config["image_endpoint_override"] = normalized
+    conn.config.config["image_api_version"] = "2"
+
+
+def _auto_fix_image_endpoint(conn: Connection) -> None:
+    """Promote unversioned Glance catalog endpoints to /v2 for older setups."""
+    configured_override = conn.config.get_endpoint("image")
+    if configured_override:
+        _apply_image_endpoint_override(conn, configured_override)
+        return
+
+    try:
+        catalog_endpoint = conn.endpoint_for("image")
+    except Exception:  # noqa: BLE001
+        return
+
+    normalized = _normalize_image_endpoint_override(catalog_endpoint)
+    if normalized and normalized != catalog_endpoint:
+        _apply_image_endpoint_override(conn, normalized)
 
 
 def connect_openstack(cloud: str = "openstack", auth_overrides: dict[str, Any] | None = None):
     try:
         if isinstance(auth_overrides, dict) and auth_overrides:
+            connect_kwargs = dict(auth_overrides)
+            if "image_endpoint_override" in connect_kwargs:
+                connect_kwargs["image_endpoint_override"] = _normalize_image_endpoint_override(
+                    connect_kwargs.get("image_endpoint_override")
+                )
+                if connect_kwargs["image_endpoint_override"]:
+                    connect_kwargs.setdefault("image_api_version", "2")
             conn = openstack.connect(
                 cloud=None,
                 load_yaml_config=False,
                 load_envvars=False,
                 app_name="vm-migrator",
                 app_version="1",
-                **auth_overrides,
+                **connect_kwargs,
             )
             conn.authorize()
+            _auto_fix_image_endpoint(conn)
             return conn
 
         env_kwargs = _connect_kwargs_from_env()
@@ -112,6 +168,7 @@ def connect_openstack(cloud: str = "openstack", auth_overrides: dict[str, Any] |
                 **env_kwargs,
             )
             conn.authorize()
+            _auto_fix_image_endpoint(conn)
             return conn
 
         image_endpoint_override = os.environ.get("OPENSTACK_IMAGE_ENDPOINT_OVERRIDE", "").strip() or None
@@ -120,11 +177,13 @@ def connect_openstack(cloud: str = "openstack", auth_overrides: dict[str, Any] |
             # which can reject PUT /v2/images/<id>/file with HTTP 415. Override to talk to Glance directly.
             cfg = OpenStackConfig(load_yaml_config=True, load_envvars=True)
             region = cfg.get_one_cloud(cloud=cloud)
-            region.config["image_endpoint_override"] = image_endpoint_override
+            region.config["image_endpoint_override"] = _normalize_image_endpoint_override(image_endpoint_override)
+            region.config["image_api_version"] = "2"
             conn = Connection(config=region)
         else:
             conn = openstack.connect(cloud=cloud)
         conn.authorize()
+        _auto_fix_image_endpoint(conn)
         return conn
     except (os_exceptions.ConfigException, os_exceptions.SDKException, ks_exceptions.ClientException) as exc:
         raise OpenStackDeploymentError(f"OpenStack connection failed for cloud '{cloud}': {exc}") from exc
@@ -169,11 +228,39 @@ def map_vmware_to_flavor(conn, cpu: int | None, ram_mb: int | None) -> FlavorCho
     return FlavorChoice(id=picked.id, name=picked.name, vcpus=int(picked.vcpus), ram=int(picked.ram))
 
 
+def _to_flavor_choice(flavor: Any) -> FlavorChoice:
+    return FlavorChoice(
+        id=str(getattr(flavor, "id", "")),
+        name=str(getattr(flavor, "name", "")),
+        vcpus=int(getattr(flavor, "vcpus", 0) or 0),
+        ram=int(getattr(flavor, "ram", 0) or 0),
+    )
+
+
+def find_flavor_choice(conn, flavor_ref: str | None) -> FlavorChoice | None:
+    if not isinstance(flavor_ref, str) or not flavor_ref.strip():
+        return None
+
+    ref = flavor_ref.strip()
+    flavor = conn.compute.find_flavor(ref, ignore_missing=True)
+    if flavor is None:
+        for candidate in conn.compute.flavors():
+            candidate_id = str(getattr(candidate, "id", "") or "")
+            candidate_name = str(getattr(candidate, "name", "") or "")
+            if ref in {candidate_id, candidate_name}:
+                flavor = candidate
+                break
+
+    if flavor is None:
+        return None
+    return _to_flavor_choice(flavor)
+
+
 def get_flavor_choice_by_id(conn, flavor_id: str) -> FlavorChoice:
-    flavor = conn.compute.find_flavor(flavor_id, ignore_missing=True)
+    flavor = find_flavor_choice(conn, flavor_id)
     if flavor is None:
         raise OpenStackDeploymentError(f"Flavor '{flavor_id}' not found.")
-    return FlavorChoice(id=flavor.id, name=flavor.name, vcpus=int(flavor.vcpus), ram=int(flavor.ram))
+    return flavor
 
 
 def select_default_network(conn, preferred_name: str | None = None, preferred_id: str | None = None):
@@ -366,10 +453,18 @@ def ensure_volume_from_image(
     if existing_volume_id:
         existing = conn.block_storage.find_volume(existing_volume_id, ignore_missing=True)
         if existing is not None:
+            existing_status = str(getattr(existing, "status", "")).lower()
+            if existing_status in {"available", "in-use", "in_use"}:
+                return existing.id
+            if existing_status in {"error", "error_extending"}:
+                raise OpenStackDeploymentError(_format_volume_error(existing, volume_name))
             return existing.id
 
     existing_by_name = conn.block_storage.find_volume(volume_name, ignore_missing=True)
     if existing_by_name is not None:
+        existing_status = str(getattr(existing_by_name, "status", "")).lower()
+        if existing_status in {"error", "error_extending"}:
+            raise OpenStackDeploymentError(_format_volume_error(existing_by_name, volume_name))
         return existing_by_name.id
 
     if size_gb is None:
@@ -403,9 +498,7 @@ def ensure_volume_from_image(
         if status == "available":
             return current.id
         if status in {"error", "error_extending"}:
-            raise OpenStackDeploymentError(
-                f"Volume '{volume_name}' entered terminal status '{status}'."
-            )
+            raise OpenStackDeploymentError(_format_volume_error(current, volume_name))
         time.sleep(max(1, poll_interval_seconds))
 
     raise OpenStackDeploymentError(f"Timed out waiting for volume '{volume_name}' to become available.")
@@ -428,10 +521,18 @@ def ensure_empty_volume(
     if existing_volume_id:
         existing = conn.block_storage.find_volume(existing_volume_id, ignore_missing=True)
         if existing is not None:
+            existing_status = str(getattr(existing, "status", "")).lower()
+            if existing_status in {"available", "in-use", "in_use"}:
+                return existing.id
+            if existing_status in {"error", "error_extending"}:
+                raise OpenStackDeploymentError(_format_volume_error(existing, volume_name))
             return existing.id
 
     existing_by_name = conn.block_storage.find_volume(volume_name, ignore_missing=True)
     if existing_by_name is not None:
+        existing_status = str(getattr(existing_by_name, "status", "")).lower()
+        if existing_status in {"error", "error_extending"}:
+            raise OpenStackDeploymentError(_format_volume_error(existing_by_name, volume_name))
         return existing_by_name.id
 
     volume = _retry_call(
@@ -451,9 +552,7 @@ def ensure_empty_volume(
         if status == "available":
             return current.id
         if status in {"error", "error_extending"}:
-            raise OpenStackDeploymentError(
-                f"Volume '{volume_name}' entered terminal status '{status}'."
-            )
+            raise OpenStackDeploymentError(_format_volume_error(current, volume_name))
         time.sleep(max(1, poll_interval_seconds))
 
     raise OpenStackDeploymentError(f"Timed out waiting for volume '{volume_name}' to become available.")
@@ -529,8 +628,80 @@ def delete_volume_if_exists(conn, volume_id: str) -> str:
     if volume is None:
         return "not_found"
 
+    _prepare_volume_for_deletion(conn, volume)
     conn.block_storage.delete_volume(volume.id, ignore_missing=True, force=True)
     return "deleted"
+
+
+def delete_volume_by_name_if_exists(conn, volume_name: str) -> tuple[str, str | None]:
+    volume = conn.block_storage.find_volume(volume_name, ignore_missing=True)
+    if volume is None:
+        return "not_found", None
+
+    _prepare_volume_for_deletion(conn, volume)
+    conn.block_storage.delete_volume(volume.id, ignore_missing=True, force=True)
+    return "deleted", str(volume.id)
+
+
+def _prepare_volume_for_deletion(conn, volume: Any, *, timeout_seconds: int = 60, poll_interval_seconds: int = 3) -> None:
+    volume_id = str(getattr(volume, "id", "") or "")
+    if not volume_id:
+        return
+
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        current = conn.block_storage.get_volume(volume_id)
+        attachments = getattr(current, "attachments", None) or []
+        if not attachments:
+            return
+
+        for attachment in attachments:
+            if not isinstance(attachment, dict):
+                continue
+            server_id = attachment.get("server_id")
+            if not server_id:
+                continue
+            try:
+                conn.compute.delete_volume_attachment(server_id, volume_id, ignore_missing=True)
+            except Exception:  # noqa: BLE001
+                continue
+
+        time.sleep(max(1, poll_interval_seconds))
+
+    current = conn.block_storage.get_volume(volume_id)
+    attachments = getattr(current, "attachments", None) or []
+    if attachments:
+        raise OpenStackDeploymentError(
+            f"Volume '{volume_id}' is still attached and could not be prepared for deletion."
+        )
+
+
+def _format_volume_error(volume: Any, volume_name: str) -> str:
+    details: list[str] = []
+    volume_id = getattr(volume, "id", None)
+    status = str(getattr(volume, "status", "")).lower() or "unknown"
+
+    if volume_id:
+        details.append(f"id={volume_id}")
+    details.append(f"status={status}")
+
+    size = getattr(volume, "size", None)
+    if size is not None:
+        details.append(f"size_gb={size}")
+
+    host = getattr(volume, "host", None)
+    if host:
+        details.append(f"host={host}")
+
+    bootable = getattr(volume, "is_bootable", None)
+    if bootable is not None:
+        details.append(f"bootable={bootable}")
+
+    image_id = getattr(volume, "image_id", None)
+    if image_id:
+        details.append(f"image_id={image_id}")
+
+    return f"Volume '{volume_name}' entered terminal status '{status}' ({', '.join(details)})."
 
 
 def build_openstack_names(vm_name: str, job_id: int) -> dict[str, str]:
