@@ -41,6 +41,7 @@ from .models import (
     OpenstackEndpointSession,
     VmwareEndpointSession,
 )
+from .network_remediation import NetworkRemediationError, apply_guest_network_remediation
 from .openstack_deployment import (
     OpenStackDeploymentError,
     attach_volume_to_server,
@@ -2125,6 +2126,24 @@ def start_migration(job_id: int) -> dict[str, Any]:
                 exec_result = _filter_execution_to_selected_disks(exec_result, target_spec["selected_disk_indexes"])
                 metadata["conversion"]["execution"] = {"state": "succeeded", **exec_result}
 
+            current_execution = metadata.get("conversion", {}).get("execution", {})
+            remediation_enabled = bool(getattr(settings, "ENABLE_GUEST_NETWORK_REMEDIATION", True))
+            remediation_applied = bool(current_execution.get("guest_network_remediation_applied"))
+            if remediation_enabled and not remediation_applied:
+                remediation_paths = current_execution.get("output_qcow2_paths")
+                if not isinstance(remediation_paths, list) or not remediation_paths:
+                    single_output = current_execution.get("output_qcow2_path")
+                    remediation_paths = [single_output] if isinstance(single_output, str) and single_output.strip() else []
+                remediation_report = apply_guest_network_remediation(
+                    [str(path) for path in remediation_paths],
+                    timeout_seconds=int(getattr(settings, "GUEST_NETWORK_REMEDIATION_TIMEOUT_SECONDS", 300)),
+                    disable_cloud_init_network_config=bool(
+                        getattr(settings, "GUEST_NETWORK_DISABLE_CLOUD_INIT_NETWORK_CONFIG", False)
+                    ),
+                )
+                metadata["conversion"]["guest_network_remediation"] = remediation_report
+                metadata["conversion"]["execution"]["guest_network_remediation_applied"] = True
+
             if bool(getattr(settings, "ENABLE_ARTIFACT_BACKUP", False)) and not already_converted:
                 try:
                     src_paths = exec_result.get("output_qcow2_paths")
@@ -2174,6 +2193,7 @@ def start_migration(job_id: int) -> dict[str, Any]:
                     "output_qcow2_path": execution_meta.get("output_qcow2_path"),
                     "disk_layout_mode": execution_meta.get("disk_layout_mode"),
                     "reused_existing_artifact": already_converted,
+                    "guest_network_remediation_applied": execution_meta.get("guest_network_remediation_applied", False),
                 },
             )
             job.refresh_from_db()
@@ -2298,6 +2318,7 @@ def start_migration(job_id: int) -> dict[str, Any]:
         BlockValidationError,
         FilesystemCheckError,
         SnapshotError,
+        NetworkRemediationError,
         InvalidTransitionError,
         PermissionError,
         OSError,

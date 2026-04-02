@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import socket
 import time
 from dataclasses import dataclass
 from math import ceil
@@ -118,6 +119,37 @@ def _apply_image_endpoint_override(conn: Connection, endpoint: str | None) -> No
     conn.config.config["image_api_version"] = "2"
 
 
+def _is_endpoint_reachable(endpoint: str | None, timeout_seconds: float = 1.0) -> bool:
+    normalized = _normalize_image_endpoint_override(endpoint)
+    if not normalized:
+        return False
+
+    parsed = urlsplit(normalized)
+    host = parsed.hostname
+    if not host:
+        return False
+
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    try:
+        with socket.create_connection((host, port), timeout=timeout_seconds):
+            return True
+    except OSError:
+        return False
+
+
+def _merge_image_endpoint_override(connect_kwargs: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(connect_kwargs)
+    configured_override = _normalize_image_endpoint_override(merged.get("image_endpoint_override"))
+    env_override = _normalize_image_endpoint_override(os.environ.get("OPENSTACK_IMAGE_ENDPOINT_OVERRIDE"))
+    effective_override = configured_override
+    if not effective_override and _is_endpoint_reachable(env_override):
+        effective_override = env_override
+    if effective_override:
+        merged["image_endpoint_override"] = effective_override
+        merged.setdefault("image_api_version", "2")
+    return merged
+
+
 def _auto_fix_image_endpoint(conn: Connection) -> None:
     """Promote unversioned Glance catalog endpoints to /v2 for older setups."""
     configured_override = conn.config.get_endpoint("image")
@@ -138,13 +170,7 @@ def _auto_fix_image_endpoint(conn: Connection) -> None:
 def connect_openstack(cloud: str = "openstack", auth_overrides: dict[str, Any] | None = None):
     try:
         if isinstance(auth_overrides, dict) and auth_overrides:
-            connect_kwargs = dict(auth_overrides)
-            if "image_endpoint_override" in connect_kwargs:
-                connect_kwargs["image_endpoint_override"] = _normalize_image_endpoint_override(
-                    connect_kwargs.get("image_endpoint_override")
-                )
-                if connect_kwargs["image_endpoint_override"]:
-                    connect_kwargs.setdefault("image_api_version", "2")
+            connect_kwargs = _merge_image_endpoint_override(auth_overrides)
             conn = openstack.connect(
                 cloud=None,
                 load_yaml_config=False,

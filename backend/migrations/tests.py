@@ -6,16 +6,23 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from django.contrib.auth import get_user_model
-from django.test import SimpleTestCase, TestCase
+from django.test import SimpleTestCase, TestCase, override_settings
 from django.utils import timezone
 from rest_framework.test import APIClient
 
+from .conversion import ConversionPlan
 from .disk_formats import DiskConversionError, convert_with_qemu_img, detect_disk_format
 from .models import (
     DiscoveredVM,
     MigrationJob,
     OpenstackEndpointSession,
     VmwareEndpointSession,
+)
+from .network_remediation import (
+    apply_guest_network_remediation,
+    render_cloud_init_network_disable_config,
+    render_network_heal_script,
+    render_network_heal_service,
 )
 from .openstack_client import OpenStackClientError
 from .openstack_deployment import (
@@ -25,6 +32,7 @@ from .openstack_deployment import (
     find_flavor_choice,
 )
 from .serializers import CreateMigrationFromVMwareSerializer, VMOverridesSerializer
+from .tasks import start_migration
 
 
 User = get_user_model()
@@ -189,6 +197,256 @@ class OpenStackDeploymentHelperTests(SimpleTestCase):
         delete_attachment_mock.assert_called_once_with("srv-1", "vol-1", ignore_missing=True)
         delete_volume_mock.assert_called_once_with("vol-1", ignore_missing=True, force=True)
         sleep_mock.assert_called_once()
+
+
+class GuestNetworkRemediationTests(SimpleTestCase):
+    def test_render_network_heal_script_is_generic(self):
+        script = render_network_heal_script()
+        self.assertIn("candidate_ifaces()", script)
+        self.assertIn("dhclient", script)
+        self.assertIn("nmcli", script)
+        self.assertNotIn("ens3", script)
+        self.assertNotIn("eth0", script)
+
+    def test_render_network_heal_service_enables_boot_execution(self):
+        service = render_network_heal_service()
+        self.assertIn("ExecStart=/usr/local/sbin/vm-migrator-network-heal", service)
+        self.assertIn("WantedBy=multi-user.target", service)
+        self.assertIn("Before=multi-user.target", service)
+
+    def test_render_cloud_init_network_disable_config(self):
+        config = render_cloud_init_network_disable_config()
+        self.assertEqual(config.strip(), "network: {config: disabled}")
+
+    @patch("migrations.network_remediation.subprocess.run")
+    @patch("migrations.network_remediation.shutil.which")
+    def test_apply_guest_network_remediation_adds_safe_cleanup(self, which_mock, run_mock):
+        which_mock.return_value = "/usr/bin/virt-customize"
+        run_mock.return_value = SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with TemporaryDirectory() as td:
+            image_path = Path(td) / "disk.qcow2"
+            image_path.write_bytes(b"QFI\xfb" + b"\x00" * 4096)
+
+            result = apply_guest_network_remediation([str(image_path)], timeout_seconds=30)
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["cloud_init_network_config_disabled"])
+        self.assertEqual(run_mock.call_count, 1)
+        cmd = run_mock.call_args.args[0]
+        joined = " ".join(cmd)
+        self.assertIn("virt-customize", cmd[0])
+        self.assertIn("70-persistent-net.rules", joined)
+        self.assertIn("ifcfg-*", joined)
+        self.assertNotIn("99-vm-migrator-disable-network-config.cfg", joined)
+
+    @patch("migrations.network_remediation.subprocess.run")
+    @patch("migrations.network_remediation.shutil.which")
+    def test_apply_guest_network_remediation_can_disable_cloud_init_network_config(self, which_mock, run_mock):
+        which_mock.return_value = "/usr/bin/virt-customize"
+        run_mock.return_value = SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with TemporaryDirectory() as td:
+            image_path = Path(td) / "disk.qcow2"
+            image_path.write_bytes(b"QFI\xfb" + b"\x00" * 4096)
+
+            result = apply_guest_network_remediation(
+                [str(image_path)],
+                timeout_seconds=30,
+                disable_cloud_init_network_config=True,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["cloud_init_network_config_disabled"])
+        cmd = run_mock.call_args.args[0]
+        joined = " ".join(cmd)
+        self.assertIn("99-vm-migrator-disable-network-config.cfg", joined)
+        self.assertIn("network-config", joined)
+
+
+class StartMigrationGuestNetworkRemediationTests(TestCase):
+    def setUp(self):
+        self.tempdir = TemporaryDirectory()
+        self.addCleanup(self.tempdir.cleanup)
+        self.source_disk = Path(self.tempdir.name) / "source.vmdk"
+        self.source_disk.write_bytes(b"KDMV" + b"\x00" * 4096)
+        self.output_disk = Path(self.tempdir.name) / "converted.qcow2"
+        self.output_disk.write_bytes(b"QFI\xfb" + b"\x00" * 4096)
+        self.plan = ConversionPlan(
+            command="qemu-img convert",
+            command_args=["qemu-img", "convert"],
+            input_disks=[str(self.source_disk)],
+            output_path=str(self.output_disk),
+            notes=[],
+        )
+
+    def _create_job_and_vm(self, *, status: str, execution: dict | None = None) -> MigrationJob:
+        DiscoveredVM.objects.create(
+            name="vm-remediate",
+            source=DiscoveredVM.Source.WORKSTATION,
+            cpu=2,
+            ram=2048,
+            disks=[{"path": str(self.source_disk)}],
+            metadata={},
+            power_state="poweredOff",
+            last_seen=timezone.now(),
+        )
+        conversion_metadata = {
+            "selected_source": DiscoveredVM.Source.WORKSTATION,
+            "requested_spec": {},
+        }
+        if execution is not None:
+            conversion_metadata["conversion"] = {"execution": execution}
+        return MigrationJob.objects.create(
+            vm_name="vm-remediate",
+            source="vmware",
+            destination="openstack",
+            status=status,
+            conversion_metadata=conversion_metadata,
+        )
+
+    @override_settings(
+        ENABLE_REAL_CONVERSION=True,
+        ENABLE_OPENSTACK_DEPLOYMENT=False,
+        ENABLE_GUEST_NETWORK_REMEDIATION=True,
+        GUEST_NETWORK_DISABLE_CLOUD_INIT_NETWORK_CONFIG=True,
+        MIGRATION_OUTPUT_DIR="/tmp",
+    )
+    @patch("migrations.tasks.run_filesystem_consistency_check")
+    @patch("migrations.tasks.validate_qcow2_images")
+    @patch("migrations.tasks.apply_guest_network_remediation")
+    @patch("migrations.tasks._execute_workstation_qemu_pipeline")
+    @patch("migrations.tasks.plan_vmware_conversion")
+    def test_start_migration_applies_guest_network_remediation_with_cloud_init_flag(
+        self,
+        plan_mock,
+        execute_mock,
+        remediation_mock,
+        block_validation_mock,
+        filesystem_mock,
+    ):
+        job = self._create_job_and_vm(status=MigrationJob.Status.CONVERTING)
+        plan_mock.return_value = self.plan
+        execute_mock.return_value = {
+            "returncode": 0,
+            "runner": "qemu-img",
+            "duration_seconds": 1,
+            "stdout": "",
+            "stderr": "",
+            "output_qcow2_path": str(self.output_disk),
+            "output_qcow2_paths": [str(self.output_disk)],
+            "primary_disk_index": 0,
+            "disk_analysis": [],
+            "disk_size": 4096,
+            "disk_sizes": {str(self.output_disk): 4096},
+            "disk_count": 1,
+            "output_disk_format": "qcow2",
+            "disk_layout_mode": "individual",
+            "concatenation": None,
+        }
+        remediation_mock.return_value = {"ok": True, "checks": [], "cloud_init_network_config_disabled": True}
+        block_validation_mock.return_value = {"ok": True, "failed": []}
+        filesystem_mock.return_value = {"ok": True, "checks": []}
+
+        result = start_migration(job.id)
+
+        self.assertEqual(result["result"], "converted")
+        remediation_mock.assert_called_once_with(
+            [str(self.output_disk)],
+            timeout_seconds=300,
+            disable_cloud_init_network_config=True,
+        )
+        job.refresh_from_db()
+        self.assertEqual(job.status, MigrationJob.Status.UPLOADING)
+        execution = job.conversion_metadata["conversion"]["execution"]
+        self.assertTrue(execution["guest_network_remediation_applied"])
+        self.assertEqual(
+            job.conversion_metadata["conversion"]["guest_network_remediation"]["cloud_init_network_config_disabled"],
+            True,
+        )
+
+    @override_settings(
+        ENABLE_REAL_CONVERSION=True,
+        ENABLE_OPENSTACK_DEPLOYMENT=False,
+        ENABLE_GUEST_NETWORK_REMEDIATION=True,
+    )
+    @patch("migrations.tasks.run_filesystem_consistency_check")
+    @patch("migrations.tasks.validate_qcow2_images")
+    @patch("migrations.tasks.apply_guest_network_remediation")
+    def test_start_migration_skips_guest_network_remediation_when_already_applied(
+        self,
+        remediation_mock,
+        block_validation_mock,
+        filesystem_mock,
+    ):
+        job = self._create_job_and_vm(
+            status=MigrationJob.Status.BLOCK_VALIDATING,
+            execution={
+                "state": "succeeded",
+                "output_qcow2_path": str(self.output_disk),
+                "output_qcow2_paths": [str(self.output_disk)],
+                "disk_sizes": {str(self.output_disk): 4096},
+                "guest_network_remediation_applied": True,
+            },
+        )
+        block_validation_mock.return_value = {"ok": True, "failed": []}
+        filesystem_mock.return_value = {"ok": True, "checks": []}
+
+        result = start_migration(job.id)
+
+        self.assertEqual(result["result"], "converted")
+        remediation_mock.assert_not_called()
+        job.refresh_from_db()
+        self.assertEqual(job.status, MigrationJob.Status.UPLOADING)
+
+    @override_settings(
+        ENABLE_REAL_CONVERSION=True,
+        ENABLE_OPENSTACK_DEPLOYMENT=False,
+        ENABLE_GUEST_NETWORK_REMEDIATION=False,
+        MIGRATION_OUTPUT_DIR="/tmp",
+    )
+    @patch("migrations.tasks.run_filesystem_consistency_check")
+    @patch("migrations.tasks.validate_qcow2_images")
+    @patch("migrations.tasks.apply_guest_network_remediation")
+    @patch("migrations.tasks._execute_workstation_qemu_pipeline")
+    @patch("migrations.tasks.plan_vmware_conversion")
+    def test_start_migration_respects_disabled_guest_network_remediation_setting(
+        self,
+        plan_mock,
+        execute_mock,
+        remediation_mock,
+        block_validation_mock,
+        filesystem_mock,
+    ):
+        job = self._create_job_and_vm(status=MigrationJob.Status.CONVERTING)
+        plan_mock.return_value = self.plan
+        execute_mock.return_value = {
+            "returncode": 0,
+            "runner": "qemu-img",
+            "duration_seconds": 1,
+            "stdout": "",
+            "stderr": "",
+            "output_qcow2_path": str(self.output_disk),
+            "output_qcow2_paths": [str(self.output_disk)],
+            "primary_disk_index": 0,
+            "disk_analysis": [],
+            "disk_size": 4096,
+            "disk_sizes": {str(self.output_disk): 4096},
+            "disk_count": 1,
+            "output_disk_format": "qcow2",
+            "disk_layout_mode": "individual",
+            "concatenation": None,
+        }
+        block_validation_mock.return_value = {"ok": True, "failed": []}
+        filesystem_mock.return_value = {"ok": True, "checks": []}
+
+        result = start_migration(job.id)
+
+        self.assertEqual(result["result"], "converted")
+        remediation_mock.assert_not_called()
+        job.refresh_from_db()
+        self.assertEqual(job.status, MigrationJob.Status.UPLOADING)
+        self.assertNotIn("guest_network_remediation", job.conversion_metadata.get("conversion", {}))
 
 
 class EndpointAccessTests(TestCase):
