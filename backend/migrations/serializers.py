@@ -55,6 +55,33 @@ class NetworkOverrideSerializer(serializers.Serializer):
     fixed_ip = serializers.IPAddressField(required=False)
 
 
+class FloatingIPOverrideSerializer(serializers.Serializer):
+    mode = serializers.ChoiceField(choices=("disabled", "auto", "manual"), required=False, default="disabled")
+    address = serializers.IPAddressField(required=False)
+    external_network_id = serializers.CharField(max_length=255, required=False, allow_blank=True)
+    external_network_name = serializers.CharField(max_length=255, required=False, allow_blank=True)
+    reuse_existing = serializers.BooleanField(required=False, default=True)
+
+    def validate(self, attrs):
+        mode = str(attrs.get("mode", "disabled") or "disabled").strip().lower()
+        attrs["mode"] = mode
+
+        external_network_id = str(attrs.get("external_network_id", "") or "").strip()
+        external_network_name = str(attrs.get("external_network_name", "") or "").strip()
+        if external_network_id:
+            attrs["external_network_id"] = external_network_id
+        else:
+            attrs.pop("external_network_id", None)
+        if external_network_name:
+            attrs["external_network_name"] = external_network_name
+        else:
+            attrs.pop("external_network_name", None)
+
+        if mode == "disabled":
+            return {"mode": "disabled"}
+        return attrs
+
+
 class VMOverridesSerializer(serializers.Serializer):
     flavor_id = serializers.CharField(max_length=255, required=False, allow_blank=True)
     cpu = serializers.IntegerField(required=False, min_value=1)
@@ -65,6 +92,7 @@ class VMOverridesSerializer(serializers.Serializer):
         allow_empty=True,
     )
     network = NetworkOverrideSerializer(required=False)
+    floating_ip = FloatingIPOverrideSerializer(required=False)
     selected_disk_indexes = serializers.ListField(
         required=False,
         child=serializers.IntegerField(min_value=0),
@@ -163,6 +191,7 @@ class CreateMigrationFromVMwareSerializer(serializers.Serializer):
             ram = override_payload.get("ram")
             extra_disks = override_payload.get("extra_disks_gb")
             network = override_payload.get("network")
+            floating_ip = override_payload.get("floating_ip")
             disk_layout_mode = override_payload.get("disk_layout_mode")
             disk_merge = override_payload.get("disk_merge")
             selected_disk_indexes = override_payload.get("selected_disk_indexes")
@@ -209,6 +238,25 @@ class CreateMigrationFromVMwareSerializer(serializers.Serializer):
                     cleaned_network["fixed_ip"] = fixed_ip.strip()
                 if cleaned_network:
                     cleaned["network"] = cleaned_network
+            if isinstance(floating_ip, dict):
+                mode = floating_ip.get("mode")
+                address = floating_ip.get("address")
+                external_network_id = floating_ip.get("external_network_id")
+                external_network_name = floating_ip.get("external_network_name")
+                reuse_existing = floating_ip.get("reuse_existing")
+                cleaned_floating_ip = {}
+                if isinstance(mode, str) and mode.strip():
+                    cleaned_floating_ip["mode"] = mode.strip().lower()
+                if isinstance(address, str) and address.strip():
+                    cleaned_floating_ip["address"] = address.strip()
+                if isinstance(external_network_id, str) and external_network_id.strip():
+                    cleaned_floating_ip["external_network_id"] = external_network_id.strip()
+                if isinstance(external_network_name, str) and external_network_name.strip():
+                    cleaned_floating_ip["external_network_name"] = external_network_name.strip()
+                if isinstance(reuse_existing, bool):
+                    cleaned_floating_ip["reuse_existing"] = reuse_existing
+                if cleaned_floating_ip and cleaned_floating_ip.get("mode", "disabled") != "disabled":
+                    cleaned["floating_ip"] = cleaned_floating_ip
 
             next_item = {**item}
             if cleaned:
@@ -221,6 +269,8 @@ class CreateMigrationFromVMwareSerializer(serializers.Serializer):
 
         flavor_ids = set()
         network_ids = set()
+        floating_external_network_ids = set()
+        floating_external_network_names = set()
         for item in value:
             overrides = item.get("overrides") or {}
             if not isinstance(overrides, dict):
@@ -233,20 +283,39 @@ class CreateMigrationFromVMwareSerializer(serializers.Serializer):
                 network_id = network.get("network_id")
                 if isinstance(network_id, str) and network_id.strip():
                     network_ids.add(network_id.strip())
+            floating_ip = overrides.get("floating_ip") or {}
+            if isinstance(floating_ip, dict):
+                external_network_id = floating_ip.get("external_network_id")
+                external_network_name = floating_ip.get("external_network_name")
+                if isinstance(external_network_id, str) and external_network_id.strip():
+                    floating_external_network_ids.add(external_network_id.strip())
+                if isinstance(external_network_name, str) and external_network_name.strip():
+                    floating_external_network_names.add(external_network_name.strip())
 
-        fixed_ip_checks = []
+        network_checks = []
         has_fixed_ip = any(
             isinstance((item.get("overrides") or {}).get("network"), dict)
             and (item.get("overrides") or {}).get("network", {}).get("fixed_ip")
             for item in value
         )
+        has_floating_ip = any(
+            isinstance((item.get("overrides") or {}).get("floating_ip"), dict)
+            and str((item.get("overrides") or {}).get("floating_ip", {}).get("mode", "") or "").strip().lower()
+            not in {"", "disabled"}
+            for item in value
+        )
 
-        if flavor_ids or network_ids or has_fixed_ip:
+        if flavor_ids or network_ids or has_fixed_ip or floating_external_network_ids or floating_external_network_names or has_floating_ip:
             try:
                 client = OpenStackClient(auth_config=openstack_session.to_connect_kwargs())
                 available_flavors = {item.get("id") for item in client.list_flavors() if item.get("id")}
                 networks_payload = client.list_networks()
                 available_networks = {item.get("id") for item in networks_payload if item.get("id")}
+                available_external_networks = {
+                    item.get("id")
+                    for item in networks_payload
+                    if item.get("id") and item.get("is_router_external") is True
+                }
                 networks_by_name: dict[str, list[str]] = {}
                 for item in networks_payload:
                     name = item.get("name")
@@ -266,6 +335,12 @@ class CreateMigrationFromVMwareSerializer(serializers.Serializer):
                         "network_id": invalid_networks,
                     }
                 )
+
+            invalid_external_networks = sorted(
+                [nid for nid in floating_external_network_ids if nid not in available_external_networks]
+            )
+            if invalid_external_networks:
+                raise serializers.ValidationError({"floating_ip.external_network_id": invalid_external_networks})
 
             for item in value:
                 overrides = item.get("overrides") or {}
@@ -289,17 +364,17 @@ class CreateMigrationFromVMwareSerializer(serializers.Serializer):
                     if len(matches) == 1:
                         resolved_network_id = matches[0]
                     elif len(matches) > 1:
-                        fixed_ip_checks.append(
+                        network_checks.append(
                             f"VM '{item.get('name')}' has ambiguous network name '{network_name}'. Select a network explicitly."
                         )
                         continue
                     else:
-                        fixed_ip_checks.append(
+                        network_checks.append(
                             f"VM '{item.get('name')}' network '{network_name}' not found for fixed IP {fixed_ip}."
                         )
                         continue
                 else:
-                    fixed_ip_checks.append(
+                    network_checks.append(
                         f"VM '{item.get('name')}' must select a network to use fixed IP {fixed_ip}."
                     )
                     continue
@@ -312,12 +387,47 @@ class CreateMigrationFromVMwareSerializer(serializers.Serializer):
                 except OpenStackClientError as exc:
                     raise serializers.ValidationError(f"OpenStack validation failed: {exc}") from exc
                 if not valid:
-                    fixed_ip_checks.append(
+                    network_checks.append(
                         f"VM '{item.get('name')}' fixed IP {fixed_ip} invalid: {reason}"
                     )
 
-        if fixed_ip_checks:
-            raise serializers.ValidationError({"fixed_ip": fixed_ip_checks})
+                floating_ip = overrides.get("floating_ip") or {}
+                if not isinstance(floating_ip, dict):
+                    continue
+                mode = str(floating_ip.get("mode", "") or "").strip().lower()
+                if mode in {"", "disabled"}:
+                    continue
+
+                external_network_name = floating_ip.get("external_network_name")
+                if isinstance(external_network_name, str) and external_network_name.strip():
+                    matches = networks_by_name.get(external_network_name.strip(), [])
+                    external_matches = [match for match in matches if match in available_external_networks]
+                    if not external_matches:
+                        network_checks.append(
+                            f"VM '{item.get('name')}' floating IP external network '{external_network_name}' was not found."
+                        )
+                    elif len(external_matches) > 1:
+                        network_checks.append(
+                            f"VM '{item.get('name')}' floating IP external network name '{external_network_name}' is ambiguous."
+                        )
+
+                floating_ip_address = floating_ip.get("address")
+                external_network_id = floating_ip.get("external_network_id")
+                if floating_ip_address:
+                    try:
+                        valid, reason = client.validate_floating_ip(
+                            address=str(floating_ip_address),
+                            external_network_id=str(external_network_id).strip() if external_network_id else None,
+                        )
+                    except OpenStackClientError as exc:
+                        raise serializers.ValidationError(f"OpenStack validation failed: {exc}") from exc
+                    if not valid:
+                        network_checks.append(
+                            f"VM '{item.get('name')}' floating IP {floating_ip_address} invalid: {reason}"
+                        )
+
+        if network_checks:
+            raise serializers.ValidationError({"network": network_checks})
 
         # Stash for the view so we do not query again.
         self.context["discovered_vm_map"] = discovered_vm_map

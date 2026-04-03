@@ -20,6 +20,15 @@ export async function fetchOpenStackNetworks(openstackEndpointSessionId = null) 
   return data?.items || []
 }
 
+export async function fetchOpenStackNetworkCatalog(openstackEndpointSessionId = null) {
+  const data = await apiFetch(withSessionQuery('/api/openstack/networks', openstackEndpointSessionId))
+  return {
+    items: data?.items || [],
+    external_networks: data?.external_networks || [],
+    available_floating_ips: data?.available_floating_ips || [],
+  }
+}
+
 export async function createOpenStackNetwork(payload) {
   return apiFetch('/api/openstack/networks/create', {
     method: 'POST',

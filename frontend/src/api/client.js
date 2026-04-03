@@ -75,5 +75,22 @@ function extractErrorMessage(payload) {
   if (payload.error) return payload.error
   if (payload.detail) return payload.detail
   if (payload.message) return payload.message
+  if (Array.isArray(payload)) {
+    const items = payload
+      .map((item) => extractErrorMessage(item))
+      .filter(Boolean)
+    return items.length ? items.join(' ') : null
+  }
+  if (typeof payload === 'object') {
+    const parts = Object.entries(payload)
+      .flatMap(([key, value]) => {
+        const message = extractErrorMessage(value)
+        if (!message) return []
+        if (/^\d+$/.test(key)) return [message]
+        return [`${key}: ${message}`]
+      })
+      .filter(Boolean)
+    return parts.length ? parts.join(' ') : null
+  }
   return null
 }

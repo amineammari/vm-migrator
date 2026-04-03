@@ -13,8 +13,8 @@ import {
   closeOpenstackEndpointSession,
   connectOpenstackEndpoint,
   createOpenStackNetwork,
+  fetchOpenStackNetworkCatalog,
   fetchOpenStackFlavors,
-  fetchOpenStackNetworks,
   fetchOpenstackEndpointSession,
   testOpenstackEndpoint,
 } from '../api/openstack'
@@ -32,6 +32,8 @@ function VMwareInventoryPage() {
   const [result, setResult] = useState(null)
   const [flavors, setFlavors] = useState([])
   const [networks, setNetworks] = useState([])
+  const [externalNetworks, setExternalNetworks] = useState([])
+  const [availableFloatingIps, setAvailableFloatingIps] = useState([])
 
   const [activeVmwareEndpoint, setActiveVmwareEndpoint] = useState(null)
   const [activeOpenstackEndpoint, setActiveOpenstackEndpoint] = useState(null)
@@ -117,11 +119,13 @@ function VMwareInventoryPage() {
           setActiveOpenstackEndpoint(session)
           const [flavorsData, networksData] = await Promise.all([
             fetchOpenStackFlavors(storedOpenstackId),
-            fetchOpenStackNetworks(storedOpenstackId),
+            fetchOpenStackNetworkCatalog(storedOpenstackId),
           ])
           if (!mounted) return
           setFlavors(flavorsData)
-          setNetworks(networksData)
+          setNetworks(networksData?.items || [])
+          setExternalNetworks(networksData?.external_networks || [])
+          setAvailableFloatingIps(networksData?.available_floating_ips || [])
         } catch {
           if (!mounted) return
           localStorage.removeItem('active_openstack_endpoint_session_id')
@@ -360,8 +364,14 @@ function VMwareInventoryPage() {
       if (endpointId) {
         localStorage.setItem('active_openstack_endpoint_session_id', String(endpointId))
       }
-      setFlavors(Array.isArray(res?.flavors) ? res.flavors : [])
-      setNetworks(Array.isArray(res?.networks) ? res.networks : [])
+      const [flavorsData, networkCatalog] = await Promise.all([
+        fetchOpenStackFlavors(endpointId),
+        fetchOpenStackNetworkCatalog(endpointId),
+      ])
+      setFlavors(flavorsData)
+      setNetworks(networkCatalog?.items || [])
+      setExternalNetworks(networkCatalog?.external_networks || [])
+      setAvailableFloatingIps(networkCatalog?.available_floating_ips || [])
       setShowOpenstackModal(false)
       setOpenstackTestPassed(false)
       setOpenstackTestMessage('')
@@ -387,6 +397,8 @@ function VMwareInventoryPage() {
       setActiveOpenstackEndpoint(null)
       setFlavors([])
       setNetworks([])
+      setExternalNetworks([])
+      setAvailableFloatingIps([])
       setNetworkCreateMessage('')
       setNetworkCreateError('')
     }
@@ -399,6 +411,8 @@ function VMwareInventoryPage() {
     }
 
     setNetworkCreateBusy(true)
+    setError('')
+    setOpenstackError('')
     setNetworkCreateMessage('')
     setNetworkCreateError('')
     try {
@@ -416,7 +430,10 @@ function VMwareInventoryPage() {
           .map((item) => item.trim())
           .filter(Boolean),
       })
-      setNetworks(Array.isArray(res?.items) ? res.items : [])
+      const refreshed = await fetchOpenStackNetworkCatalog(activeOpenstackEndpoint.id)
+      setNetworks(refreshed?.items || [])
+      setExternalNetworks(refreshed?.external_networks || [])
+      setAvailableFloatingIps(refreshed?.available_floating_ips || [])
       setNetworkCreateMessage(res?.message || 'Network created successfully.')
       setNetworkCreateForm((current) => ({
         ...current,
@@ -490,9 +507,13 @@ function VMwareInventoryPage() {
               <button
                 className="secondary-btn"
                 onClick={async () => {
+                  setError('')
+                  setOpenstackError('')
                   setNetworkCreateError('')
-                  const refreshed = await fetchOpenStackNetworks(activeOpenstackEndpoint.id)
-                  setNetworks(refreshed)
+                  const refreshed = await fetchOpenStackNetworkCatalog(activeOpenstackEndpoint.id)
+                  setNetworks(refreshed?.items || [])
+                  setExternalNetworks(refreshed?.external_networks || [])
+                  setAvailableFloatingIps(refreshed?.available_floating_ips || [])
                 }}
                 disabled={networkCreateBusy}
               >
@@ -607,6 +628,7 @@ function VMwareInventoryPage() {
                 {selectedVMs.map((vm) => {
                   const key = makeKey(vm)
                   const spec = specByKey[key] || buildDefaultSpec(vm)
+                  const selectedFloatingNetwork = externalNetworks.find((item) => item.id === spec.floating_ip_external_network_id)
                   return (
                     <article className="spec-card" key={`spec-${key}`}>
                       <h4>{vm.name}</h4>
@@ -695,6 +717,78 @@ function VMwareInventoryPage() {
                             onChange: (value) => updateSpec(vm, 'fixed_ip', value),
                           })}
                         </label>
+                        <label>
+                          <span>Floating IP mode</span>
+                          <select
+                            value={spec.floating_ip_mode}
+                            onChange={(e) => {
+                              const nextMode = e.target.value
+                              updateSpecValues(vm, {
+                                floating_ip_mode: nextMode,
+                                floating_ip_address: nextMode === 'disabled' ? '' : spec.floating_ip_address,
+                              })
+                            }}
+                            disabled={!activeOpenstackEndpoint}
+                          >
+                            <option value="disabled">Disabled</option>
+                            <option value="auto">Automatic</option>
+                            <option value="manual">Manual</option>
+                          </select>
+                        </label>
+                        <label>
+                          <span>External network</span>
+                          {externalNetworks.length ? (
+                            <select
+                              value={spec.floating_ip_external_network_id}
+                              onChange={(e) => {
+                                const nextNetworkId = e.target.value
+                                const nextNetwork = externalNetworks.find((item) => item.id === nextNetworkId)
+                                updateSpecValues(vm, {
+                                  floating_ip_external_network_id: nextNetworkId,
+                                  floating_ip_external_network_name: nextNetwork?.name || '',
+                                  floating_ip_address: '',
+                                })
+                              }}
+                              disabled={!activeOpenstackEndpoint || spec.floating_ip_mode === 'disabled'}
+                            >
+                              <option value="">Auto-detect external network</option>
+                              {externalNetworks.map((network) => (
+                                <option key={network.id} value={network.id}>
+                                  {network.name || network.id}
+                                </option>
+                              ))}
+                            </select>
+                          ) : (
+                            <input
+                              type="text"
+                              value={spec.floating_ip_external_network_name}
+                              onChange={(e) => updateSpec(vm, 'floating_ip_external_network_name', e.target.value)}
+                              placeholder="public"
+                              disabled={spec.floating_ip_mode === 'disabled'}
+                            />
+                          )}
+                        </label>
+                        {spec.floating_ip_mode !== 'disabled' && (
+                          <div className="span-2">
+                            <span>Floating IP</span>
+                            {renderFloatingIpField({
+                              spec,
+                              externalNetwork: selectedFloatingNetwork,
+                              availableFloatingIps,
+                              onChange: (value) => updateSpec(vm, 'floating_ip_address', value),
+                            })}
+                          </div>
+                        )}
+                        {spec.floating_ip_mode === 'auto' && (
+                          <label className="checkbox-line span-2">
+                            <input
+                              type="checkbox"
+                              checked={Boolean(spec.floating_ip_reuse_existing)}
+                              onChange={(e) => updateSpec(vm, 'floating_ip_reuse_existing', e.target.checked)}
+                            />
+                            <span>Reuse an available Floating IP before allocating a new one</span>
+                          </label>
+                        )}
                         <label className="span-2">
                           <span>Extra disks (GB, comma-separated)</span>
                           <input
@@ -985,6 +1079,11 @@ function buildDefaultSpec(vm) {
     network_id: '',
     network_name: inferNetworkName(metadata),
     fixed_ip: inferFixedIp(metadata),
+    floating_ip_mode: 'disabled',
+    floating_ip_address: '',
+    floating_ip_external_network_id: '',
+    floating_ip_external_network_name: '',
+    floating_ip_reuse_existing: true,
     extra_disks_gb: '',
     selected_disk_indexes: allDiskIndexes,
     system_disk_index: systemDiskIndex,
@@ -1024,6 +1123,28 @@ function buildOverrides(spec) {
     network.fixed_ip = spec.fixed_ip.trim()
   }
   if (Object.keys(network).length) overrides.network = network
+
+  const floatingIpMode = typeof spec?.floating_ip_mode === 'string' ? spec.floating_ip_mode.trim().toLowerCase() : 'disabled'
+  if (floatingIpMode && floatingIpMode !== 'disabled') {
+    const floatingIp = { mode: floatingIpMode }
+    if (typeof spec?.floating_ip_address === 'string' && spec.floating_ip_address.trim()) {
+      floatingIp.address = spec.floating_ip_address.trim()
+    }
+    if (typeof spec?.floating_ip_external_network_id === 'string' && spec.floating_ip_external_network_id.trim()) {
+      floatingIp.external_network_id = spec.floating_ip_external_network_id.trim()
+    }
+    if (
+      typeof spec?.floating_ip_external_network_name === 'string' &&
+      spec.floating_ip_external_network_name.trim() &&
+      !floatingIp.external_network_id
+    ) {
+      floatingIp.external_network_name = spec.floating_ip_external_network_name.trim()
+    }
+    if (typeof spec?.floating_ip_reuse_existing === 'boolean') {
+      floatingIp.reuse_existing = spec.floating_ip_reuse_existing
+    }
+    overrides.floating_ip = floatingIp
+  }
 
   return overrides
 }
@@ -1200,6 +1321,65 @@ function renderFixedIpField({ spec, network, onChange }) {
             : `${displayCount} IPs available in selected network.`}
         </span>
       )}
+    </div>
+  )
+}
+
+function getAvailableFloatingIps(availableFloatingIps, externalNetworkId) {
+  const items = Array.isArray(availableFloatingIps) ? availableFloatingIps : []
+  const filtered = externalNetworkId
+    ? items.filter((item) => item?.floating_network_id === externalNetworkId)
+    : items
+
+  return filtered
+    .filter((item) => typeof item?.address === 'string' && item.address.trim())
+    .sort((a, b) => String(a.address).localeCompare(String(b.address)))
+}
+
+function renderFloatingIpField({ spec, externalNetwork, availableFloatingIps, onChange }) {
+  const items = getAvailableFloatingIps(availableFloatingIps, spec?.floating_ip_external_network_id)
+  const showSelect = items.length > 0
+  const mode = spec?.floating_ip_mode || 'disabled'
+  const helperBits = []
+
+  if (mode === 'auto') {
+    helperBits.push('Leave the address empty to auto-allocate or reuse a Floating IP.')
+  }
+  if (mode === 'manual') {
+    helperBits.push('Pick an unassigned Floating IP or enter one manually.')
+  }
+  if (externalNetwork?.name) {
+    helperBits.push(`External network: ${externalNetwork.name}`)
+  }
+  if (!externalNetwork && spec?.floating_ip_external_network_id) {
+    helperBits.push('Selected external network is no longer in the current catalog.')
+  }
+
+  return (
+    <div className="floating-ip-field">
+      {showSelect && (
+        <select value={spec.floating_ip_address} onChange={(e) => onChange(e.target.value)}>
+          <option value="">
+            {mode === 'manual' ? 'Choose an available Floating IP' : 'Auto-select or allocate'}
+          </option>
+          {items.map((item) => (
+            <option key={item.id || item.address} value={item.address}>
+              {item.address}
+            </option>
+          ))}
+        </select>
+      )}
+      <input
+        type="text"
+        value={spec.floating_ip_address}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder="203.0.113.25"
+      />
+      <span className="helper-text">
+        {showSelect
+          ? `${formatCount(items.length)} unassigned Floating IPs visible.${helperBits.length ? ` ${helperBits.join(' ')}` : ''}`
+          : helperBits.join(' ') || 'Enter an existing Floating IP address.'}
+      </span>
     </div>
   )
 }

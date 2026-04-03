@@ -191,6 +191,36 @@ vm-migrator/
 
 - Terraform modules for OpenStack network and security-group bootstrap
 - Optional Ansible-based conversion execution
+- Optional Ansible-based OpenStack host bridge wiring bootstrap
+
+### OpenStack Host Networking Automation
+
+If your OpenStack or DevStack host uses OVN/OVS with a provider network on `br-ex`, you should manage that host wiring declaratively instead of repairing it by hand.
+
+This repository now includes:
+- [devstack-network.yml](/home/amin/Desktop/vm-migrator/ansible/playbooks/devstack-network.yml)
+
+What it does:
+- updates `PUBLIC_INTERFACE` in DevStack `local.conf`
+- ensures the host uplink is attached to the configured OVS bridge
+- moves the host IP and default route onto the bridge
+- installs a boot-time `systemd` repair unit so the bridge wiring survives reboot
+
+Example usage:
+
+```bash
+cd /home/amin/Desktop/vm-migrator
+ansible-playbook \
+  -i ansible/inventory/hosts.ini \
+  ansible/playbooks/devstack-network.yml \
+  -e openstack_target_group=openstack_hosts \
+  -e public_interface=ens33 \
+  -e public_bridge=br-ex \
+  -e public_cidr=192.168.72.200/24 \
+  -e public_gateway=192.168.72.2
+```
+
+This playbook is meant for the OpenStack host itself, not the migrated guest.
 
 ## Current Migration State Model
 

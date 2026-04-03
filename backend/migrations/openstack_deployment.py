@@ -13,6 +13,7 @@ from typing import Any, Callable
 from urllib.parse import urlsplit, urlunsplit
 
 import openstack
+from django.conf import settings
 from keystoneauth1 import exceptions as ks_exceptions
 from openstack import exceptions as os_exceptions
 from openstack.config import OpenStackConfig
@@ -32,6 +33,29 @@ class FlavorChoice:
     name: str
     vcpus: int
     ram: int
+
+
+@dataclass
+class FloatingIPAssignment:
+    address: str
+    id: str | None
+    port_id: str | None
+    status: str
+    mode: str
+    external_network_id: str | None
+    external_network_name: str | None
+    reused_existing: bool
+    ssh_command_example: str
+
+
+@dataclass(frozen=True)
+class SecurityGroupRuleSpec:
+    direction: str
+    ether_type: str
+    protocol: str | None = None
+    port_range_min: int | None = None
+    port_range_max: int | None = None
+    remote_ip_prefix: str | None = None
 
 
 def _sanitize_name(value: str) -> str:
@@ -462,6 +486,395 @@ def ensure_server_booted_from_volume(
     )
 
     return server.id
+
+
+def _coerce_bool(value: Any, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        parsed = _bool_from_env(value)
+        if parsed is not None:
+            return parsed
+    return default
+
+
+def _baseline_security_group_name() -> str:
+    return str(getattr(settings, "OPENSTACK_BASELINE_ACCESS_SECURITY_GROUP_NAME", "") or "").strip()
+
+
+def _baseline_security_group_description() -> str:
+    return str(getattr(settings, "OPENSTACK_BASELINE_ACCESS_SECURITY_GROUP_DESCRIPTION", "") or "").strip()
+
+
+def _baseline_security_group_rule_specs() -> list[SecurityGroupRuleSpec]:
+    raw_rules = getattr(settings, "OPENSTACK_BASELINE_ACCESS_SECURITY_GROUP_RULES", []) or []
+    specs: list[SecurityGroupRuleSpec] = []
+    for item in raw_rules:
+        if not isinstance(item, dict):
+            continue
+        direction = str(item.get("direction", "") or "").strip()
+        ether_type = str(item.get("ether_type", "") or "").strip()
+        if not direction or not ether_type:
+            continue
+        protocol = str(item.get("protocol", "") or "").strip() or None
+        specs.append(
+            SecurityGroupRuleSpec(
+                direction=direction,
+                ether_type=ether_type,
+                protocol=protocol,
+                port_range_min=item.get("port_range_min"),
+                port_range_max=item.get("port_range_max"),
+                remote_ip_prefix=str(item.get("remote_ip_prefix", "") or "").strip() or None,
+            )
+        )
+    return specs
+
+
+def _find_security_group_by_name(conn, *, name: str) -> Any | None:
+    try:
+        found = conn.network.find_security_group(name, ignore_missing=True)
+    except Exception:  # noqa: BLE001
+        found = None
+    if found is not None:
+        return found
+
+    for candidate in conn.network.security_groups():
+        if str(getattr(candidate, "name", "") or "") == name:
+            return candidate
+    return None
+
+
+def _list_security_group_rules(conn, *, security_group_id: str) -> list[Any]:
+    try:
+        return list(conn.network.security_group_rules(security_group_id=security_group_id))
+    except TypeError:
+        return [
+            rule
+            for rule in conn.network.security_group_rules()
+            if str(getattr(rule, "security_group_id", "") or "") == str(security_group_id)
+        ]
+
+
+def _security_group_rule_matches(rule: Any, spec: SecurityGroupRuleSpec) -> bool:
+    return (
+        str(getattr(rule, "direction", "") or "") == spec.direction
+        and str(getattr(rule, "ether_type", "") or "") == spec.ether_type
+        and str(getattr(rule, "protocol", "") or "") == str(spec.protocol or "")
+        and (getattr(rule, "port_range_min", None) == spec.port_range_min)
+        and (getattr(rule, "port_range_max", None) == spec.port_range_max)
+        and str(getattr(rule, "remote_ip_prefix", "") or "") == str(spec.remote_ip_prefix or "")
+    )
+
+
+def ensure_server_access_baseline(
+    conn,
+    *,
+    server_id: str,
+    retries: int = 2,
+    retry_delay_seconds: int = 3,
+) -> str:
+    if not bool(getattr(settings, "OPENSTACK_ENSURE_BASELINE_ACCESS_SECURITY_GROUP", True)):
+        return ""
+
+    security_group_name = _baseline_security_group_name()
+    if not security_group_name:
+        return ""
+
+    security_group = _find_security_group_by_name(conn, name=security_group_name)
+    if security_group is None:
+        security_group = _retry_call(
+            "security group create",
+            retries,
+            retry_delay_seconds,
+            lambda: conn.network.create_security_group(
+                name=security_group_name,
+                description=_baseline_security_group_description(),
+            ),
+        )
+
+    rules = _list_security_group_rules(conn, security_group_id=str(getattr(security_group, "id", "") or ""))
+    for spec in _baseline_security_group_rule_specs():
+        if any(_security_group_rule_matches(rule, spec) for rule in rules):
+            continue
+        payload: dict[str, Any] = {
+            "security_group_id": security_group.id,
+            "direction": spec.direction,
+            "ether_type": spec.ether_type,
+        }
+        if spec.protocol:
+            payload["protocol"] = spec.protocol
+        if spec.port_range_min is not None:
+            payload["port_range_min"] = spec.port_range_min
+        if spec.port_range_max is not None:
+            payload["port_range_max"] = spec.port_range_max
+        if spec.remote_ip_prefix:
+            payload["remote_ip_prefix"] = spec.remote_ip_prefix
+        _retry_call(
+            "security group rule create",
+            retries,
+            retry_delay_seconds,
+            lambda payload=payload: conn.network.create_security_group_rule(**payload),
+        )
+
+    server = conn.compute.get_server(server_id)
+    attached_names = {
+        str((item or {}).get("name", "") or "")
+        for item in getattr(server, "security_groups", None) or []
+        if isinstance(item, dict)
+    }
+    security_group_name = str(getattr(security_group, "name", "") or security_group_name)
+    if security_group_name not in attached_names:
+        _retry_call(
+            "security group attach",
+            retries,
+            retry_delay_seconds,
+            lambda: conn.compute.add_security_group_to_server(server_id, security_group_name),
+        )
+
+    return str(getattr(security_group, "id", "") or "")
+
+
+def _list_server_ports(conn, server_id: str) -> list[Any]:
+    return list(conn.network.ports(device_id=server_id))
+
+
+def _extract_fixed_ip_addresses(port: Any) -> list[str]:
+    values: list[str] = []
+    for item in getattr(port, "fixed_ips", None) or []:
+        if not isinstance(item, dict):
+            continue
+        ip_value = item.get("ip_address")
+        if isinstance(ip_value, str) and ip_value.strip():
+            values.append(ip_value.strip())
+    return values
+
+
+def _select_server_port(
+    conn,
+    *,
+    server_id: str,
+    attached_network_id: str | None = None,
+    fixed_ip: str | None = None,
+) -> Any:
+    ports = _list_server_ports(conn, server_id)
+    if not ports:
+        raise OpenStackDeploymentError(f"Server '{server_id}' has no Neutron ports to bind a floating IP.")
+
+    if attached_network_id:
+        for port in ports:
+            if str(getattr(port, "network_id", "") or "") == str(attached_network_id):
+                return port
+
+    if fixed_ip:
+        for port in ports:
+            if fixed_ip in _extract_fixed_ip_addresses(port):
+                return port
+
+    return ports[0]
+
+
+def _find_external_network(
+    conn,
+    *,
+    preferred_id: str | None = None,
+    preferred_name: str | None = None,
+) -> Any:
+    networks = [network for network in conn.network.networks() if getattr(network, "is_router_external", False) is True]
+    if not networks:
+        raise OpenStackDeploymentError(
+            "No external OpenStack network was found. Configure an external/provider network before requesting a floating IP."
+        )
+
+    if preferred_id:
+        for network in networks:
+            if str(getattr(network, "id", "") or "") == str(preferred_id):
+                return network
+        raise OpenStackDeploymentError(f"External network '{preferred_id}' was not found or is not marked external.")
+
+    if preferred_name:
+        matches = [network for network in networks if str(getattr(network, "name", "") or "") == str(preferred_name)]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise OpenStackDeploymentError(
+                f"External network name '{preferred_name}' is ambiguous. Select the external network by ID instead."
+            )
+        raise OpenStackDeploymentError(f"External network '{preferred_name}' was not found or is not marked external.")
+
+    networks.sort(
+        key=lambda network: (
+            0 if str(getattr(network, "name", "") or "").strip().lower() == "public" else 1,
+            0 if str(getattr(network, "name", "") or "").strip().lower() == "ext-net" else 1,
+            str(getattr(network, "name", "") or ""),
+            str(getattr(network, "id", "") or ""),
+        )
+    )
+    return networks[0]
+
+
+def _find_floating_ip_resource(conn, *, address: str) -> Any | None:
+    try:
+        found = conn.network.find_ip(address, ignore_missing=True)
+    except Exception:  # noqa: BLE001
+        found = None
+    if found is not None:
+        return found
+
+    for floating_ip in conn.network.ips():
+        current_address = str(getattr(floating_ip, "floating_ip_address", "") or "")
+        if current_address == address:
+            return floating_ip
+    return None
+
+
+def _list_server_floating_ips(conn, *, server_id: str) -> list[Any]:
+    port_ids = {
+        str(getattr(port, "id", "") or "")
+        for port in _list_server_ports(conn, server_id)
+        if str(getattr(port, "id", "") or "")
+    }
+    attached: list[Any] = []
+    for floating_ip in conn.network.ips():
+        port_id = str(getattr(floating_ip, "port_id", "") or "")
+        if port_id and port_id in port_ids:
+            attached.append(floating_ip)
+    attached.sort(key=lambda item: str(getattr(item, "floating_ip_address", "") or ""))
+    return attached
+
+
+def _pick_unassigned_floating_ip(conn, *, external_network_id: str) -> Any | None:
+    available: list[Any] = []
+    for floating_ip in conn.network.ips():
+        if str(getattr(floating_ip, "floating_network_id", "") or "") != str(external_network_id):
+            continue
+        if getattr(floating_ip, "port_id", None):
+            continue
+        available.append(floating_ip)
+
+    available.sort(key=lambda item: str(getattr(item, "floating_ip_address", "") or ""))
+    return available[0] if available else None
+
+
+def ensure_server_floating_ip(
+    conn,
+    *,
+    server_id: str,
+    attached_network_id: str | None = None,
+    fixed_ip: str | None = None,
+    floating_ip: dict[str, Any] | None = None,
+    server_name: str | None = None,
+    retries: int = 2,
+    retry_delay_seconds: int = 3,
+) -> FloatingIPAssignment | None:
+    config = floating_ip if isinstance(floating_ip, dict) else {}
+    mode = str(config.get("mode", "") or "").strip().lower()
+    if not mode or mode == "disabled":
+        return None
+    if mode not in {"auto", "manual"}:
+        raise OpenStackDeploymentError(
+            f"Unsupported floating IP mode '{mode}'. Use 'auto', 'manual', or omit the option."
+        )
+
+    port = _select_server_port(
+        conn,
+        server_id=server_id,
+        attached_network_id=attached_network_id,
+        fixed_ip=fixed_ip,
+    )
+
+    existing_assignments = _list_server_floating_ips(conn, server_id=server_id)
+    if existing_assignments:
+        current = existing_assignments[0]
+        current_address = str(getattr(current, "floating_ip_address", "") or "")
+        if current_address:
+            return FloatingIPAssignment(
+                address=current_address,
+                id=str(getattr(current, "id", "") or "") or None,
+                port_id=str(getattr(current, "port_id", "") or "") or None,
+                status="already_attached",
+                mode=mode,
+                external_network_id=str(getattr(current, "floating_network_id", "") or "") or None,
+                external_network_name=None,
+                reused_existing=True,
+                ssh_command_example=f"ssh user@{current_address}",
+            )
+
+    requested_address = str(config.get("address", "") or "").strip() or None
+    preferred_external_network_id = str(config.get("external_network_id", "") or "").strip() or None
+    preferred_external_network_name = str(config.get("external_network_name", "") or "").strip() or None
+    reuse_existing = _coerce_bool(config.get("reuse_existing"), default=True)
+
+    floating_ip_resource = None
+    external_network = None
+    reused_existing_ip = False
+
+    if requested_address:
+        floating_ip_resource = _find_floating_ip_resource(conn, address=requested_address)
+        if floating_ip_resource is None:
+            raise OpenStackDeploymentError(f"Floating IP '{requested_address}' was not found.")
+
+        current_port_id = str(getattr(floating_ip_resource, "port_id", "") or "") or None
+        if current_port_id and current_port_id != str(getattr(port, "id", "") or ""):
+            raise OpenStackDeploymentError(
+                f"Floating IP '{requested_address}' is already associated with another port and cannot be reused."
+            )
+        external_network_id = str(getattr(floating_ip_resource, "floating_network_id", "") or "") or None
+        external_network = _find_external_network(
+            conn,
+            preferred_id=preferred_external_network_id or external_network_id,
+            preferred_name=preferred_external_network_name if not (preferred_external_network_id or external_network_id) else None,
+        )
+    else:
+        external_network = _find_external_network(
+            conn,
+            preferred_id=preferred_external_network_id,
+            preferred_name=preferred_external_network_name,
+        )
+        if reuse_existing:
+            floating_ip_resource = _pick_unassigned_floating_ip(conn, external_network_id=external_network.id)
+            reused_existing_ip = floating_ip_resource is not None
+        if floating_ip_resource is None and mode == "manual":
+            raise OpenStackDeploymentError(
+                "Manual floating IP mode requested but no unassigned floating IP is available on the selected external network."
+            )
+        if floating_ip_resource is None:
+            floating_ip_resource = _retry_call(
+                "floating IP allocate",
+                retries,
+                retry_delay_seconds,
+                lambda: conn.network.create_ip(floating_network_id=external_network.id),
+            )
+
+    floating_ip_address = str(getattr(floating_ip_resource, "floating_ip_address", "") or "") or requested_address
+    if not floating_ip_address:
+        raise OpenStackDeploymentError("Floating IP allocation succeeded but no floating IP address was returned.")
+
+    current_port_id = str(getattr(floating_ip_resource, "port_id", "") or "") or None
+    if current_port_id != str(getattr(port, "id", "") or ""):
+        floating_ip_resource = _retry_call(
+            "floating IP associate",
+            retries,
+            retry_delay_seconds,
+            lambda: conn.network.update_ip(floating_ip_resource, port_id=port.id),
+        )
+
+    external_network_name = None
+    if external_network is not None:
+        external_network_name = str(getattr(external_network, "name", "") or "") or None
+
+    return FloatingIPAssignment(
+        address=floating_ip_address,
+        id=str(getattr(floating_ip_resource, "id", "") or "") or None,
+        port_id=str(getattr(floating_ip_resource, "port_id", "") or "") or None,
+        status="associated",
+        mode=mode,
+        external_network_id=str(getattr(floating_ip_resource, "floating_network_id", "") or "") or (
+            str(getattr(external_network, "id", "") or "") or None
+        ),
+        external_network_name=external_network_name,
+        reused_existing=reused_existing_ip or bool(requested_address),
+        ssh_command_example=f"ssh user@{floating_ip_address}",
+    )
 
 
 def ensure_volume_from_image(

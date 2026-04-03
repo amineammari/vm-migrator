@@ -51,7 +51,9 @@ from .openstack_deployment import (
     delete_server_if_exists,
     delete_volume_by_name_if_exists,
     delete_volume_if_exists,
+    ensure_server_access_baseline,
     ensure_server_booted_from_volume,
+    ensure_server_floating_ip,
     ensure_empty_volume,
     ensure_uploaded_image,
     ensure_volume_from_image,
@@ -1296,6 +1298,7 @@ def _effective_target_spec(job: MigrationJob, discovered_vm: DiscoveredVM) -> di
     network_id = network_overrides.get("network_id")
     network_name = network_overrides.get("network_name")
     fixed_ip = network_overrides.get("fixed_ip")
+    floating_ip_overrides = requested.get("floating_ip", {}) if isinstance(requested.get("floating_ip"), dict) else {}
 
     if not isinstance(network_id, str) or not network_id.strip():
         network_id = None
@@ -1312,6 +1315,34 @@ def _effective_target_spec(job: MigrationJob, discovered_vm: DiscoveredVM) -> di
     else:
         fixed_ip = fixed_ip.strip()
 
+    floating_ip_mode = floating_ip_overrides.get("mode")
+    if not isinstance(floating_ip_mode, str) or not floating_ip_mode.strip():
+        floating_ip_mode = "disabled"
+    else:
+        floating_ip_mode = floating_ip_mode.strip().lower()
+
+    floating_ip_address = floating_ip_overrides.get("address")
+    if not isinstance(floating_ip_address, str) or not floating_ip_address.strip():
+        floating_ip_address = None
+    else:
+        floating_ip_address = floating_ip_address.strip()
+
+    external_network_id = floating_ip_overrides.get("external_network_id")
+    if not isinstance(external_network_id, str) or not external_network_id.strip():
+        external_network_id = None
+    else:
+        external_network_id = external_network_id.strip()
+
+    external_network_name = floating_ip_overrides.get("external_network_name")
+    if not isinstance(external_network_name, str) or not external_network_name.strip():
+        external_network_name = None
+    else:
+        external_network_name = external_network_name.strip()
+
+    floating_ip_reuse_existing = floating_ip_overrides.get("reuse_existing")
+    if not isinstance(floating_ip_reuse_existing, bool):
+        floating_ip_reuse_existing = True
+
     raw_extra_disks = requested.get("extra_disks_gb")
     extra_disks_gb: list[int] = []
     if isinstance(raw_extra_disks, list):
@@ -1326,6 +1357,13 @@ def _effective_target_spec(job: MigrationJob, discovered_vm: DiscoveredVM) -> di
         "network_id": network_id,
         "network_name": network_name,
         "fixed_ip": fixed_ip,
+        "floating_ip": {
+            "mode": floating_ip_mode,
+            "address": floating_ip_address,
+            "external_network_id": external_network_id,
+            "external_network_name": external_network_name,
+            "reuse_existing": floating_ip_reuse_existing,
+        },
         "extra_disks_gb": extra_disks_gb,
         "selected_disk_indexes": selected_disk_indexes,
         "system_disk_index": selected_disk_indexes[0] if selected_disk_indexes else 0,
@@ -1776,9 +1814,13 @@ def _run_openstack_deployment(job: MigrationJob, discovered_vm: DiscoveredVM) ->
             "network_id": network.id,
             "network_name": network.name,
             "fixed_ip": target_spec["fixed_ip"],
+            "floating_ip_requested": target_spec.get("floating_ip"),
+            "floating_ip": None,
+            "floating_ip_details": None,
             "server_id": server_id,
             "server_name": names["server_name"],
             "server_status_before_attach": server_ready_status,
+            "access_security_group_id": None,
             "boot_volume_id": primary_volume_id,
             "boot_disk_index": primary_disk_index,
             "volume_ids": converted_volume_ids,
@@ -1800,6 +1842,45 @@ def _run_openstack_deployment(job: MigrationJob, discovered_vm: DiscoveredVM) ->
         timeout_seconds=int(getattr(settings, "OPENSTACK_VERIFY_TIMEOUT", 900)),
         poll_interval_seconds=int(getattr(settings, "OPENSTACK_VERIFY_POLL_INTERVAL", 10)),
     )
+
+    os_meta["access_security_group_id"] = ensure_server_access_baseline(
+        conn,
+        server_id=server_id,
+        retries=int(getattr(settings, "OPENSTACK_API_RETRIES", 2)),
+        retry_delay_seconds=int(getattr(settings, "OPENSTACK_API_RETRY_DELAY", 3)),
+    )
+    _persist_openstack_progress()
+
+    floating_ip_request = dict(target_spec.get("floating_ip") or {})
+    if floating_ip_request.get("mode") in {"auto", "manual"}:
+        default_external_network = str(getattr(settings, "OPENSTACK_DEFAULT_EXTERNAL_NETWORK", "") or "").strip()
+        if default_external_network and not floating_ip_request.get("external_network_name") and not floating_ip_request.get("external_network_id"):
+            floating_ip_request["external_network_name"] = default_external_network
+
+    floating_ip_assignment = ensure_server_floating_ip(
+        conn,
+        server_id=server_id,
+        attached_network_id=network.id,
+        fixed_ip=target_spec["fixed_ip"],
+        floating_ip=floating_ip_request,
+        server_name=names["server_name"],
+        retries=int(getattr(settings, "OPENSTACK_API_RETRIES", 2)),
+        retry_delay_seconds=int(getattr(settings, "OPENSTACK_API_RETRY_DELAY", 3)),
+    )
+    if floating_ip_assignment is not None:
+        os_meta["floating_ip"] = floating_ip_assignment.address
+        os_meta["floating_ip_details"] = {
+            "id": floating_ip_assignment.id,
+            "address": floating_ip_assignment.address,
+            "port_id": floating_ip_assignment.port_id,
+            "status": floating_ip_assignment.status,
+            "mode": floating_ip_assignment.mode,
+            "external_network_id": floating_ip_assignment.external_network_id,
+            "external_network_name": floating_ip_assignment.external_network_name,
+            "reused_existing": floating_ip_assignment.reused_existing,
+            "ssh_command_example": floating_ip_assignment.ssh_command_example,
+        }
+        _persist_openstack_progress()
 
     os_meta["server_status"] = verified_status
     os_meta["verified_at"] = timezone.now().isoformat()
@@ -1842,6 +1923,8 @@ def _run_openstack_deployment(job: MigrationJob, discovered_vm: DiscoveredVM) ->
         "volume_ids": converted_volume_ids,
         "flavor": {"id": flavor.id, "name": flavor.name},
         "network": {"id": network.id, "name": network.name},
+        "floating_ip": floating_ip_assignment.address if floating_ip_assignment is not None else None,
+        "ssh_command_example": floating_ip_assignment.ssh_command_example if floating_ip_assignment is not None else None,
     }
 
 

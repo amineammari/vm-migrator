@@ -29,6 +29,8 @@ from .openstack_deployment import (
     _auto_fix_image_endpoint,
     _normalize_image_endpoint_override,
     delete_volume_if_exists,
+    ensure_server_access_baseline,
+    ensure_server_floating_ip,
     find_flavor_choice,
 )
 from .serializers import CreateMigrationFromVMwareSerializer, VMOverridesSerializer
@@ -197,6 +199,193 @@ class OpenStackDeploymentHelperTests(SimpleTestCase):
         delete_attachment_mock.assert_called_once_with("srv-1", "vol-1", ignore_missing=True)
         delete_volume_mock.assert_called_once_with("vol-1", ignore_missing=True, force=True)
         sleep_mock.assert_called_once()
+
+    def test_ensure_server_floating_ip_reuses_existing_unassigned_ip(self):
+        port = SimpleNamespace(
+            id="port-1",
+            network_id="tenant-net-1",
+            fixed_ips=[{"ip_address": "10.0.0.15", "subnet_id": "subnet-1"}],
+        )
+        external_network = SimpleNamespace(id="ext-net-1", name="public", is_router_external=True)
+        floating_ip = SimpleNamespace(
+            id="fip-1",
+            floating_ip_address="203.0.113.10",
+            floating_network_id="ext-net-1",
+            port_id=None,
+        )
+        updated_floating_ip = SimpleNamespace(
+            id="fip-1",
+            floating_ip_address="203.0.113.10",
+            floating_network_id="ext-net-1",
+            port_id="port-1",
+        )
+        update_ip_mock = Mock(return_value=updated_floating_ip)
+
+        conn = SimpleNamespace(
+            network=SimpleNamespace(
+                ports=lambda device_id=None: [port] if device_id == "server-1" else [],
+                networks=lambda: [external_network],
+                ips=lambda: [floating_ip],
+                find_ip=lambda value, ignore_missing=True: None,
+                update_ip=update_ip_mock,
+                create_ip=Mock(),
+            )
+        )
+
+        assignment = ensure_server_floating_ip(
+            conn,
+            server_id="server-1",
+            attached_network_id="tenant-net-1",
+            floating_ip={"mode": "auto", "reuse_existing": True},
+        )
+
+        self.assertIsNotNone(assignment)
+        self.assertEqual(assignment.address, "203.0.113.10")
+        self.assertTrue(assignment.reused_existing)
+        self.assertEqual(assignment.external_network_name, "public")
+        update_ip_mock.assert_called_once_with(floating_ip, port_id="port-1")
+        conn.network.create_ip.assert_not_called()
+
+    def test_ensure_server_floating_ip_is_idempotent_when_already_attached(self):
+        port = SimpleNamespace(
+            id="port-1",
+            network_id="tenant-net-1",
+            fixed_ips=[{"ip_address": "10.0.0.15", "subnet_id": "subnet-1"}],
+        )
+        attached_floating_ip = SimpleNamespace(
+            id="fip-1",
+            floating_ip_address="203.0.113.10",
+            floating_network_id="ext-net-1",
+            port_id="port-1",
+        )
+
+        conn = SimpleNamespace(
+            network=SimpleNamespace(
+                ports=lambda device_id=None: [port] if device_id == "server-1" else [],
+                networks=lambda: [SimpleNamespace(id="ext-net-1", name="public", is_router_external=True)],
+                ips=lambda: [attached_floating_ip],
+                find_ip=lambda value, ignore_missing=True: None,
+                update_ip=Mock(),
+                create_ip=Mock(),
+            )
+        )
+
+        assignment = ensure_server_floating_ip(
+            conn,
+            server_id="server-1",
+            attached_network_id="tenant-net-1",
+            floating_ip={"mode": "auto"},
+        )
+
+        self.assertIsNotNone(assignment)
+        self.assertEqual(assignment.address, "203.0.113.10")
+        self.assertEqual(assignment.status, "already_attached")
+        conn.network.update_ip.assert_not_called()
+        conn.network.create_ip.assert_not_called()
+
+    def test_ensure_server_access_baseline_creates_rules_and_attaches_group(self):
+        created_security_group = SimpleNamespace(id="sg-1", name="vm-migrator-access")
+        existing_rules = [
+            SimpleNamespace(
+                security_group_id="sg-1",
+                direction="egress",
+                ether_type="IPv4",
+                protocol=None,
+                port_range_min=None,
+                port_range_max=None,
+                remote_ip_prefix="0.0.0.0/0",
+            )
+        ]
+        create_rule_mock = Mock()
+        add_security_group_mock = Mock()
+
+        conn = SimpleNamespace(
+            network=SimpleNamespace(
+                find_security_group=lambda name, ignore_missing=True: None,
+                security_groups=lambda: [],
+                create_security_group=Mock(return_value=created_security_group),
+                security_group_rules=lambda security_group_id=None: existing_rules if security_group_id == "sg-1" else [],
+                create_security_group_rule=create_rule_mock,
+            ),
+            compute=SimpleNamespace(
+                get_server=lambda server_id: SimpleNamespace(id=server_id, security_groups=[{"name": "default"}]),
+                add_security_group_to_server=add_security_group_mock,
+            ),
+        )
+
+        security_group_id = ensure_server_access_baseline(conn, server_id="server-1")
+
+        self.assertEqual(security_group_id, "sg-1")
+        conn.network.create_security_group.assert_called_once()
+        self.assertEqual(create_rule_mock.call_count, 3)
+        add_security_group_mock.assert_called_once_with("server-1", "vm-migrator-access")
+
+    def test_ensure_server_access_baseline_is_idempotent(self):
+        security_group = SimpleNamespace(id="sg-1", name="vm-migrator-access")
+        rules = [
+            SimpleNamespace(
+                security_group_id="sg-1",
+                direction="ingress",
+                ether_type="IPv4",
+                protocol="icmp",
+                port_range_min=None,
+                port_range_max=None,
+                remote_ip_prefix="0.0.0.0/0",
+            ),
+            SimpleNamespace(
+                security_group_id="sg-1",
+                direction="ingress",
+                ether_type="IPv4",
+                protocol="tcp",
+                port_range_min=22,
+                port_range_max=22,
+                remote_ip_prefix="0.0.0.0/0",
+            ),
+            SimpleNamespace(
+                security_group_id="sg-1",
+                direction="egress",
+                ether_type="IPv4",
+                protocol=None,
+                port_range_min=None,
+                port_range_max=None,
+                remote_ip_prefix="0.0.0.0/0",
+            ),
+            SimpleNamespace(
+                security_group_id="sg-1",
+                direction="egress",
+                ether_type="IPv6",
+                protocol=None,
+                port_range_min=None,
+                port_range_max=None,
+                remote_ip_prefix="::/0",
+            ),
+        ]
+        create_rule_mock = Mock()
+        add_security_group_mock = Mock()
+
+        conn = SimpleNamespace(
+            network=SimpleNamespace(
+                find_security_group=lambda name, ignore_missing=True: security_group,
+                security_groups=lambda: [security_group],
+                create_security_group=Mock(),
+                security_group_rules=lambda security_group_id=None: rules if security_group_id == "sg-1" else [],
+                create_security_group_rule=create_rule_mock,
+            ),
+            compute=SimpleNamespace(
+                get_server=lambda server_id: SimpleNamespace(
+                    id=server_id,
+                    security_groups=[{"name": "default"}, {"name": "vm-migrator-access"}],
+                ),
+                add_security_group_to_server=add_security_group_mock,
+            ),
+        )
+
+        security_group_id = ensure_server_access_baseline(conn, server_id="server-1")
+
+        self.assertEqual(security_group_id, "sg-1")
+        conn.network.create_security_group.assert_not_called()
+        create_rule_mock.assert_not_called()
+        add_security_group_mock.assert_not_called()
 
 
 class GuestNetworkRemediationTests(SimpleTestCase):
@@ -961,8 +1150,9 @@ class SessionOwnershipTests(TestCase):
         self.assertEqual(MigrationJob.objects.count(), 0)
         mock_delay.assert_not_called()
 
+    @patch("migrations.serializers.OpenStackClient")
     @patch("migrations.views.start_migration.delay")
-    def test_user_creates_migration_with_owned_sessions(self, mock_delay):
+    def test_user_creates_migration_with_owned_sessions(self, mock_delay, mock_openstack_client_cls):
         DiscoveredVM.objects.create(
             name="vm-owned",
             source=DiscoveredVM.Source.ESXI,
@@ -974,6 +1164,14 @@ class SessionOwnershipTests(TestCase):
             power_state="off",
             last_seen=timezone.now(),
         )
+        mock_openstack_client = mock_openstack_client_cls.return_value
+        mock_openstack_client.list_flavors.return_value = []
+        mock_openstack_client.list_networks.return_value = [
+            {"id": "tenant-net-1", "name": "tenant-net", "is_router_external": False},
+            {"id": "ext-net-1", "name": "public", "is_router_external": True},
+        ]
+        mock_openstack_client.validate_fixed_ip.return_value = (True, None)
+        mock_openstack_client.validate_floating_ip.return_value = (True, None)
 
         self.client.force_authenticate(self.user)
         response = self.client.post(
@@ -985,7 +1183,14 @@ class SessionOwnershipTests(TestCase):
                     {
                         "name": "vm-owned",
                         "source": "esxi",
-                        "overrides": {"selected_disk_indexes": [0]},
+                        "overrides": {
+                            "selected_disk_indexes": [0],
+                            "floating_ip": {
+                                "mode": "auto",
+                                "reuse_existing": True,
+                                "external_network_name": "public",
+                            },
+                        },
                     }
                 ],
             },
@@ -995,4 +1200,7 @@ class SessionOwnershipTests(TestCase):
         self.assertEqual(MigrationJob.objects.count(), 1)
         job = MigrationJob.objects.first()
         self.assertEqual(job.conversion_metadata["requested_spec"]["selected_disk_indexes"], [0])
+        self.assertEqual(job.conversion_metadata["requested_spec"]["floating_ip"]["mode"], "auto")
+        self.assertTrue(job.conversion_metadata["requested_spec"]["floating_ip"]["reuse_existing"])
+        self.assertEqual(job.conversion_metadata["requested_spec"]["floating_ip"]["external_network_name"], "public")
         mock_delay.assert_called_once()

@@ -276,8 +276,17 @@ a {
   min-width: 0;
 }
 
+.floating-ip-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
 .fixed-ip-field input,
-.fixed-ip-field select {
+.fixed-ip-field select,
+.floating-ip-field input,
+.floating-ip-field select {
   width: 100%;
   min-width: 0;
 }

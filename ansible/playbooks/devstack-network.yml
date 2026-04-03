@@ -1,0 +1,132 @@
+---
+- name: Persist OpenStack external bridge wiring
+  hosts: "{{ openstack_target_group | default('openstack_hosts') }}"
+  become: true
+  gather_facts: true
+
+  vars:
+    public_interface: "{{ public_interface | default('ens33') }}"
+    public_bridge: "{{ public_bridge | default('br-ex') }}"
+    public_cidr: "{{ public_cidr | default('') }}"
+    public_gateway: "{{ public_gateway | default('') }}"
+    devstack_local_conf: "{{ devstack_local_conf | default('/opt/stack/devstack/local.conf') }}"
+    bridge_rebind_script_path: /usr/local/sbin/devstack-br-ex-rebind
+    bridge_rebind_service_path: /etc/systemd/system/devstack-br-ex-rebind.service
+
+  tasks:
+    - name: Validate required variables
+      ansible.builtin.assert:
+        that:
+          - public_interface | length > 0
+          - public_bridge | length > 0
+          - public_cidr | length > 0
+          - public_gateway | length > 0
+        fail_msg: "public_interface, public_bridge, public_cidr, and public_gateway are required"
+
+    - name: Ensure Open vSwitch packages are present on Debian/Ubuntu
+      ansible.builtin.apt:
+        name:
+          - openvswitch-switch
+        state: present
+        update_cache: true
+      when: ansible_os_family == 'Debian'
+
+    - name: Ensure Open vSwitch service is enabled and running
+      ansible.builtin.systemd:
+        name: openvswitch-switch
+        state: started
+        enabled: true
+
+    - name: Update DevStack local.conf PUBLIC_INTERFACE
+      ansible.builtin.lineinfile:
+        path: "{{ devstack_local_conf }}"
+        regexp: '^PUBLIC_INTERFACE='
+        line: "PUBLIC_INTERFACE={{ public_interface }}"
+        create: false
+      when: devstack_local_conf | length > 0
+
+    - name: Install bridge rebind script
+      ansible.builtin.copy:
+        dest: "{{ bridge_rebind_script_path }}"
+        mode: "0755"
+        content: |
+          #!/bin/bash
+          set -euo pipefail
+
+          BRIDGE="{{ public_bridge }}"
+          UPLINK="{{ public_interface }}"
+          ADDR="{{ public_cidr }}"
+          GATEWAY="{{ public_gateway }}"
+
+          log() {
+            logger -t devstack-br-ex-rebind "$*"
+            echo "$*"
+          }
+
+          if ! command -v ovs-vsctl >/dev/null 2>&1; then
+            log "ovs-vsctl not available; skipping"
+            exit 0
+          fi
+
+          if ! ip link show "$UPLINK" >/dev/null 2>&1; then
+            log "uplink $UPLINK not found; skipping"
+            exit 0
+          fi
+
+          ovs-vsctl --may-exist add-port "$BRIDGE" "$UPLINK"
+          ip link set "$UPLINK" up
+          ip link set "$BRIDGE" up
+
+          ip addr replace "$ADDR" dev "$BRIDGE"
+          ip addr flush dev "$UPLINK"
+          ip route replace default via "$GATEWAY" dev "$BRIDGE"
+
+          log "bridge rebind complete"
+
+    - name: Install bridge rebind systemd unit
+      ansible.builtin.copy:
+        dest: "{{ bridge_rebind_service_path }}"
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Rebind OpenStack external uplink to {{ public_bridge }} after boot
+          Wants=network-online.target openvswitch-switch.service
+          After=network-online.target openvswitch-switch.service
+
+          [Service]
+          Type=oneshot
+          ExecStart={{ bridge_rebind_script_path }}
+          RemainAfterExit=yes
+
+          [Install]
+          WantedBy=multi-user.target
+      notify:
+        - Reload systemd
+
+    - name: Enable and run bridge rebind service
+      ansible.builtin.systemd:
+        name: devstack-br-ex-rebind.service
+        enabled: true
+        state: started
+
+    - name: Verify bridge owns the public address
+      ansible.builtin.command: ip -4 -o addr show dev {{ public_bridge }}
+      register: public_bridge_addr
+      changed_when: false
+
+    - name: Verify public interface is attached to the bridge
+      ansible.builtin.command: ovs-vsctl list-ports {{ public_bridge }}
+      register: public_bridge_ports
+      changed_when: false
+
+    - name: Assert bridge state looks correct
+      ansible.builtin.assert:
+        that:
+          - public_cidr in public_bridge_addr.stdout
+          - public_interface in public_bridge_ports.stdout_lines
+        fail_msg: "The external uplink was not bound to the expected bridge state"
+
+  handlers:
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true

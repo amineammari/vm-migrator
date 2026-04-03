@@ -182,6 +182,7 @@ VMWARE_REQUIRE_NO_SNAPSHOTS = env.bool("VMWARE_REQUIRE_NO_SNAPSHOTS", default=Tr
 ENABLE_OPENSTACK_DEPLOYMENT = env.bool("ENABLE_OPENSTACK_DEPLOYMENT", default=False)
 OPENSTACK_CLOUD_NAME = env("OPENSTACK_CLOUD_NAME", default="openstack")
 OPENSTACK_DEFAULT_NETWORK = env("OPENSTACK_DEFAULT_NETWORK", default="")
+OPENSTACK_DEFAULT_EXTERNAL_NETWORK = env("OPENSTACK_DEFAULT_EXTERNAL_NETWORK", default="")
 # Optional. When DevStack publishes a broken /image proxy endpoint, point this to Glance directly
 # (eg http://192.168.72.169:60999 after exposing it on 0.0.0.0 on the OpenStack node).
 OPENSTACK_IMAGE_ENDPOINT_OVERRIDE = env("OPENSTACK_IMAGE_ENDPOINT_OVERRIDE", default="")
@@ -191,6 +192,55 @@ OPENSTACK_IMAGE_UPLOAD_TIMEOUT = env.int("OPENSTACK_IMAGE_UPLOAD_TIMEOUT", defau
 OPENSTACK_IMAGE_UPLOAD_POLL_INTERVAL = env.int("OPENSTACK_IMAGE_UPLOAD_POLL_INTERVAL", default=5)
 OPENSTACK_API_RETRIES = env.int("OPENSTACK_API_RETRIES", default=2)
 OPENSTACK_API_RETRY_DELAY = env.int("OPENSTACK_API_RETRY_DELAY", default=3)
+OPENSTACK_ENSURE_BASELINE_ACCESS_SECURITY_GROUP = env.bool(
+    "OPENSTACK_ENSURE_BASELINE_ACCESS_SECURITY_GROUP",
+    default=True,
+)
+OPENSTACK_BASELINE_ACCESS_SECURITY_GROUP_NAME = env(
+    "OPENSTACK_BASELINE_ACCESS_SECURITY_GROUP_NAME",
+    default="vm-migrator-access",
+)
+OPENSTACK_BASELINE_ACCESS_SECURITY_GROUP_DESCRIPTION = env(
+    "OPENSTACK_BASELINE_ACCESS_SECURITY_GROUP_DESCRIPTION",
+    default="Baseline ingress/egress rules for migrated VMs.",
+)
+_openstack_sg_rules_raw = env(
+    "OPENSTACK_BASELINE_ACCESS_SECURITY_GROUP_RULES_JSON",
+    default=json.dumps(
+        [
+            {
+                "direction": "ingress",
+                "ether_type": "IPv4",
+                "protocol": "icmp",
+                "remote_ip_prefix": "0.0.0.0/0",
+            },
+            {
+                "direction": "ingress",
+                "ether_type": "IPv4",
+                "protocol": "tcp",
+                "port_range_min": 22,
+                "port_range_max": 22,
+                "remote_ip_prefix": "0.0.0.0/0",
+            },
+            {
+                "direction": "egress",
+                "ether_type": "IPv4",
+                "remote_ip_prefix": "0.0.0.0/0",
+            },
+            {
+                "direction": "egress",
+                "ether_type": "IPv6",
+                "remote_ip_prefix": "::/0",
+            },
+        ]
+    ),
+)
+try:
+    OPENSTACK_BASELINE_ACCESS_SECURITY_GROUP_RULES = (
+        json.loads(_openstack_sg_rules_raw) if _openstack_sg_rules_raw else []
+    )
+except json.JSONDecodeError:
+    OPENSTACK_BASELINE_ACCESS_SECURITY_GROUP_RULES = []
 
 # Ansible conversion controls
 ENABLE_ANSIBLE_CONVERSION = env.bool("ENABLE_ANSIBLE_CONVERSION", default=False)

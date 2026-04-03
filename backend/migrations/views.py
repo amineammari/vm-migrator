@@ -215,6 +215,8 @@ def openstack_networks(request):
         return Response(
             {
                 "items": client.list_networks_detail(),
+                "external_networks": client.list_external_networks(),
+                "available_floating_ips": client.list_floating_ips(available_only=True),
                 "openstack_endpoint_session_id": endpoint_session.id if endpoint_session else None,
             },
             status=status.HTTP_200_OK,

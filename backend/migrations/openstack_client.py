@@ -153,6 +153,45 @@ class OpenStackClient:
         except Exception as exc:
             raise OpenStackClientError(f"Unexpected error while listing OpenStack networks: {exc}") from exc
 
+    def list_external_networks(self) -> list[dict[str, Any]]:
+        """List networks that can allocate floating IPs."""
+        try:
+            return [
+                item
+                for item in self.list_networks()
+                if item.get("id") and item.get("is_router_external") is True
+            ]
+        except OpenStackClientError:
+            raise
+        except Exception as exc:
+            raise OpenStackClientError(f"Unexpected error while listing external networks: {exc}") from exc
+
+    def list_floating_ips(self, *, available_only: bool = False) -> list[dict[str, Any]]:
+        """List floating IPs visible to the active project."""
+        try:
+            items: list[dict[str, Any]] = []
+            for floating_ip in self._conn.network.ips():
+                port_id = getattr(floating_ip, "port_id", None)
+                if available_only and port_id:
+                    continue
+                items.append(
+                    {
+                        "id": getattr(floating_ip, "id", None),
+                        "address": getattr(floating_ip, "floating_ip_address", None),
+                        "status": getattr(floating_ip, "status", None),
+                        "port_id": port_id,
+                        "fixed_ip_address": getattr(floating_ip, "fixed_ip_address", None),
+                        "floating_network_id": getattr(floating_ip, "floating_network_id", None),
+                        "router_id": getattr(floating_ip, "router_id", None),
+                    }
+                )
+            items.sort(key=lambda item: (str(item.get("address") or ""), str(item.get("id") or "")))
+            return items
+        except (os_exceptions.SDKException, ks_exceptions.ClientException) as exc:
+            raise OpenStackClientError(f"Failed to list floating IPs: {exc}") from exc
+        except Exception as exc:
+            raise OpenStackClientError(f"Unexpected error while listing floating IPs: {exc}") from exc
+
     def list_networks_detail(self) -> list[dict[str, Any]]:
         """List available tenant/provider networks with subnet pools and available IPs."""
         try:
@@ -334,6 +373,30 @@ class OpenStackClient:
             raise OpenStackClientError(f"Failed to validate fixed IP: {exc}") from exc
         except Exception as exc:
             raise OpenStackClientError(f"Unexpected error while validating fixed IP: {exc}") from exc
+
+    def validate_floating_ip(
+        self,
+        *,
+        address: str,
+        external_network_id: str | None = None,
+    ) -> tuple[bool, str | None]:
+        """Validate that a floating IP exists and is currently unassigned."""
+        try:
+            for floating_ip in self._conn.network.ips():
+                current_address = str(getattr(floating_ip, "floating_ip_address", "") or "")
+                if current_address != str(address):
+                    continue
+                current_network_id = str(getattr(floating_ip, "floating_network_id", "") or "") or None
+                if external_network_id and current_network_id != str(external_network_id):
+                    return False, "Floating IP belongs to a different external network."
+                if getattr(floating_ip, "port_id", None):
+                    return False, "Floating IP is already assigned."
+                return True, None
+            return False, "Floating IP not found."
+        except (os_exceptions.SDKException, ks_exceptions.ClientException) as exc:
+            raise OpenStackClientError(f"Failed to validate floating IP: {exc}") from exc
+        except Exception as exc:
+            raise OpenStackClientError(f"Unexpected error while validating floating IP: {exc}") from exc
 
 
 def _format_subnet_details(subnet: Any, used_ips: set[int], limit: int) -> dict[str, Any]:
