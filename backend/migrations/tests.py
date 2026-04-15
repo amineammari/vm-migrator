@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 from django.contrib.auth import get_user_model
 from django.test import SimpleTestCase, TestCase, override_settings
 from django.utils import timezone
+from openstack import exceptions as os_exceptions
 from rest_framework.test import APIClient
 
 from .conversion import ConversionPlan
@@ -24,6 +25,7 @@ from .network_remediation import (
     render_network_heal_script,
     render_network_heal_service,
 )
+from .os_profile import detect_os_profile
 from .openstack_client import OpenStackClientError
 from .openstack_deployment import (
     _auto_fix_image_endpoint,
@@ -387,6 +389,44 @@ class OpenStackDeploymentHelperTests(SimpleTestCase):
         create_rule_mock.assert_not_called()
         add_security_group_mock.assert_not_called()
 
+    def test_ensure_server_access_baseline_ignores_conflict_when_rule_exists(self):
+        security_group = SimpleNamespace(id="sg-1", name="vm-migrator-access")
+        existing_rules: list[SimpleNamespace] = []
+
+        def create_rule(**kwargs):
+            rule = SimpleNamespace(**kwargs)
+            if not existing_rules:
+                existing_rules.append(rule)
+                raise os_exceptions.ConflictException("already exists")
+            existing_rules.append(rule)
+            return rule
+
+        create_rule_mock = Mock(side_effect=create_rule)
+        add_security_group_mock = Mock()
+
+        conn = SimpleNamespace(
+            network=SimpleNamespace(
+                find_security_group=lambda name, ignore_missing=True: security_group,
+                security_groups=lambda: [security_group],
+                create_security_group=Mock(),
+                security_group_rules=lambda security_group_id=None: existing_rules if security_group_id == "sg-1" else [],
+                create_security_group_rule=create_rule_mock,
+            ),
+            compute=SimpleNamespace(
+                get_server=lambda server_id: SimpleNamespace(
+                    id=server_id,
+                    security_groups=[{"name": "default"}],
+                ),
+                add_security_group_to_server=add_security_group_mock,
+            ),
+        )
+
+        security_group_id = ensure_server_access_baseline(conn, server_id="server-1")
+
+        self.assertEqual(security_group_id, "sg-1")
+        self.assertEqual(create_rule_mock.call_count, 4)
+        add_security_group_mock.assert_called_once_with("server-1", "vm-migrator-access")
+
 
 class GuestNetworkRemediationTests(SimpleTestCase):
     def test_render_network_heal_script_is_generic(self):
@@ -394,6 +434,9 @@ class GuestNetworkRemediationTests(SimpleTestCase):
         self.assertIn("candidate_ifaces()", script)
         self.assertIn("dhclient", script)
         self.assertIn("nmcli", script)
+        self.assertIn("/etc/systemd/resolved.conf", script)
+        self.assertIn("99-disable-network-config.cfg", script)
+        self.assertIn("addresses: [$DNS_PRIMARY_1, $DNS_PRIMARY_2]", script)
         self.assertNotIn("ens3", script)
         self.assertNotIn("eth0", script)
 
@@ -449,8 +492,49 @@ class GuestNetworkRemediationTests(SimpleTestCase):
         self.assertTrue(result["cloud_init_network_config_disabled"])
         cmd = run_mock.call_args.args[0]
         joined = " ".join(cmd)
-        self.assertIn("99-vm-migrator-disable-network-config.cfg", joined)
+        self.assertIn("99-disable-network-config.cfg", joined)
         self.assertIn("network-config", joined)
+
+
+class OSDetectionTests(SimpleTestCase):
+    def test_detect_ubuntu_from_vmware_metadata(self):
+        discovered_vm = SimpleNamespace(metadata={"guest_id": "ubuntu64Guest", "guest_full_name": "Ubuntu Linux"})
+        profile = detect_os_profile(discovered_vm)
+        self.assertEqual(profile.family, "linux")
+        self.assertEqual(profile.distro, "ubuntu")
+        self.assertEqual(profile.package_manager, "apt")
+
+    def test_detect_centos_from_vmware_metadata(self):
+        discovered_vm = SimpleNamespace(metadata={"guest_id": "centos7_64Guest", "guest_full_name": "CentOS 7"})
+        profile = detect_os_profile(discovered_vm)
+        self.assertEqual(profile.family, "linux")
+        self.assertEqual(profile.distro, "centos")
+        self.assertEqual(profile.package_manager, "yum")
+
+    def test_detect_windows_from_vmware_metadata(self):
+        discovered_vm = SimpleNamespace(metadata={"guest_id": "windows9_64Guest", "guest_full_name": "Microsoft Windows Server"})
+        profile = detect_os_profile(discovered_vm)
+        self.assertEqual(profile.family, "windows")
+        self.assertEqual(profile.connection_method, "winrm")
+
+    def test_detect_from_runtime_os_names_fallback(self):
+        discovered_vm = SimpleNamespace(metadata={})
+        execution = {
+            "disk_analysis": [
+                {
+                    "os_names": ["debian"],
+                }
+            ]
+        }
+        profile = detect_os_profile(discovered_vm, execution)
+        self.assertEqual(profile.family, "linux")
+        self.assertEqual(profile.distro, "debian")
+
+    def test_unknown_os_profile_is_marked_unsupported(self):
+        discovered_vm = SimpleNamespace(metadata={"guest_id": "mysteryOS"})
+        profile = detect_os_profile(discovered_vm)
+        self.assertEqual(profile.family, "unknown")
+        self.assertFalse(profile.supported)
 
 
 class StartMigrationGuestNetworkRemediationTests(TestCase):
@@ -476,7 +560,7 @@ class StartMigrationGuestNetworkRemediationTests(TestCase):
             cpu=2,
             ram=2048,
             disks=[{"path": str(self.source_disk)}],
-            metadata={},
+            metadata={"guest_id": "ubuntu64Guest", "guest_full_name": "Ubuntu Linux"},
             power_state="poweredOff",
             last_seen=timezone.now(),
         )
@@ -636,6 +720,63 @@ class StartMigrationGuestNetworkRemediationTests(TestCase):
         job.refresh_from_db()
         self.assertEqual(job.status, MigrationJob.Status.UPLOADING)
         self.assertNotIn("guest_network_remediation", job.conversion_metadata.get("conversion", {}))
+
+    @override_settings(
+        ENABLE_REAL_CONVERSION=True,
+        ENABLE_OPENSTACK_DEPLOYMENT=False,
+        ENABLE_GUEST_NETWORK_REMEDIATION=True,
+        MIGRATION_OUTPUT_DIR="/tmp",
+    )
+    @patch("migrations.tasks.run_filesystem_consistency_check")
+    @patch("migrations.tasks.validate_qcow2_images")
+    @patch("migrations.tasks.apply_guest_network_remediation")
+    @patch("migrations.tasks._execute_workstation_qemu_pipeline")
+    @patch("migrations.tasks.plan_vmware_conversion")
+    def test_start_migration_skips_linux_guest_remediation_for_windows(
+        self,
+        plan_mock,
+        execute_mock,
+        remediation_mock,
+        block_validation_mock,
+        filesystem_mock,
+    ):
+        job = self._create_job_and_vm(status=MigrationJob.Status.CONVERTING)
+        vm = DiscoveredVM.objects.get(name="vm-remediate", source=DiscoveredVM.Source.WORKSTATION)
+        vm.metadata = {"guest_id": "windows9_64Guest", "guest_full_name": "Windows Server"}
+        vm.save(update_fields=["metadata"])
+
+        plan_mock.return_value = self.plan
+        execute_mock.return_value = {
+            "returncode": 0,
+            "runner": "qemu-img",
+            "duration_seconds": 1,
+            "stdout": "",
+            "stderr": "",
+            "output_qcow2_path": str(self.output_disk),
+            "output_qcow2_paths": [str(self.output_disk)],
+            "primary_disk_index": 0,
+            "disk_analysis": [],
+            "disk_size": 4096,
+            "disk_sizes": {str(self.output_disk): 4096},
+            "disk_count": 1,
+            "output_disk_format": "qcow2",
+            "disk_layout_mode": "individual",
+            "concatenation": None,
+        }
+        block_validation_mock.return_value = {"ok": True, "failed": []}
+        filesystem_mock.return_value = {"ok": True, "checks": []}
+
+        result = start_migration(job.id)
+
+        self.assertEqual(result["result"], "converted")
+        remediation_mock.assert_not_called()
+        job.refresh_from_db()
+        self.assertEqual(job.status, MigrationJob.Status.UPLOADING)
+        self.assertEqual(job.conversion_metadata.get("os_profile", {}).get("family"), "windows")
+        self.assertEqual(
+            job.conversion_metadata.get("conversion", {}).get("guest_network_remediation", {}).get("reason"),
+            "windows_guest_no_linux_remediation",
+        )
 
 
 class EndpointAccessTests(TestCase):

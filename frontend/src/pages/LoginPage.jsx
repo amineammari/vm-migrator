@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { useAuth } from '../contexts/AuthContext'
+import { Alert, Button, Field } from '../components/ui'
+import { useAuth } from '../contexts/useAuth'
 
 function LoginPage() {
   const navigate = useNavigate()
@@ -30,30 +31,28 @@ function LoginPage() {
         <h2>Sign In</h2>
         <p className="auth-copy">Use your VM Migrator account to access dashboards and migrations.</p>
 
-        <label>
-          <span>Username</span>
+        <Field label="Username">
           <input
             value={form.username}
             onChange={(event) => setForm((current) => ({ ...current, username: event.target.value }))}
             required
           />
-        </label>
+        </Field>
 
-        <label>
-          <span>Password</span>
+        <Field label="Password">
           <input
             type="password"
             value={form.password}
             onChange={(event) => setForm((current) => ({ ...current, password: event.target.value }))}
             required
           />
-        </label>
+        </Field>
 
-        {error ? <div className="alert error">{error}</div> : null}
+        {error ? <Alert>{error}</Alert> : null}
 
-        <button className="primary-btn auth-submit" disabled={submitting} type="submit">
+        <Button className="auth-submit" disabled={submitting} type="submit">
           {submitting ? 'Signing in...' : 'Login'}
-        </button>
+        </Button>
       </form>
     </div>
   )

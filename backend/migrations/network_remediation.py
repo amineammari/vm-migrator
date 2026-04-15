@@ -15,29 +15,96 @@ _SCRIPT_PATH = "/usr/local/sbin/vm-migrator-network-heal"
 _UNIT_PATH = "/etc/systemd/system/vm-migrator-network-heal.service"
 _WANTS_PATH = "/etc/systemd/system/multi-user.target.wants/vm-migrator-network-heal.service"
 _CLOUD_INIT_DISABLE_TMP_PATH = "/tmp/vm-migrator-disable-cloud-init-network.cfg"
-_CLOUD_INIT_DISABLE_PATH = "/etc/cloud/cloud.cfg.d/99-vm-migrator-disable-network-config.cfg"
+_CLOUD_INIT_DISABLE_PATH = "/etc/cloud/cloud.cfg.d/99-disable-network-config.cfg"
 
 
 def render_network_heal_script() -> str:
     return """#!/bin/sh
-set -eu
+set -u
+set -o pipefail
 
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
+LOG_FILE=/var/log/vmigrate-network-fix.log
+CLOUD_CFG_FILE=/etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
+RESOLVED_CONF=/etc/systemd/resolved.conf
+NETPLAN_DIR=/etc/netplan
+NETPLAN_FILE=/etc/netplan/99-vmigrate-dns.yaml
+
+DNS_PRIMARY_1=8.8.8.8
+DNS_PRIMARY_2=1.1.1.1
+DNS_FALLBACK=8.8.4.4
+
+FAIL_COUNT=0
+PRIMARY_IFACE=
+
+mkdir -p "$(dirname "$LOG_FILE")"
+touch "$LOG_FILE"
+chmod 0644 "$LOG_FILE" || true
+exec >>"$LOG_FILE" 2>&1
+
+timestamp() {
+  date '+%Y-%m-%d %H:%M:%S%z'
+}
+
 log() {
+  printf '[%s] %s\\n' "$(timestamp)" "$*"
   if command -v logger >/dev/null 2>&1; then
-    logger -t vm-migrator-network-heal "$*"
+    logger -t vm-migrator-network-heal "$*" || true
   fi
-  printf '%s\\n' "$*" >&2
 }
 
-has_default_route() {
-  [ -n "$(ip -4 route show default 2>/dev/null)" ] || [ -n "$(ip -6 route show default 2>/dev/null)" ]
+warn() {
+  log "WARN: $*"
 }
 
-has_global_address() {
-  iface="$1"
-  ip -o addr show dev "$iface" scope global 2>/dev/null | grep -q 'inet\\|inet6'
+error() {
+  log "ERROR: $*"
+}
+
+run_step() {
+  step_name="$1"
+  shift
+  log "STEP START: $step_name"
+  if "$@"; then
+    log "STEP OK: $step_name"
+    return 0
+  fi
+  error "STEP FAILED: $step_name"
+  FAIL_COUNT=$((FAIL_COUNT + 1))
+  return 1
+}
+
+write_if_changed() {
+  target="$1"
+  content="$2"
+  tmp="$(mktemp)"
+
+  printf '%s\\n' "$content" > "$tmp"
+  if [ -f "$target" ] && cmp -s "$tmp" "$target"; then
+    rm -f "$tmp"
+    log "No change needed: $target"
+    return 0
+  fi
+
+  mkdir -p "$(dirname "$target")"
+  install -m 0644 "$tmp" "$target"
+  rm -f "$tmp"
+  log "Updated: $target"
+  return 0
+}
+
+set_or_append_kv() {
+  file="$1"
+  key="$2"
+  value="$3"
+
+  touch "$file"
+  if grep -Eq "^[[:space:]]*#?[[:space:]]*${key}=" "$file"; then
+    sed -i -E "s|^[[:space:]]*#?[[:space:]]*${key}=.*|${key}=${value}|g" "$file"
+  else
+    printf '%s=%s\\n' "$key" "$value" >> "$file"
+  fi
 }
 
 candidate_ifaces() {
@@ -85,25 +152,129 @@ try_dhcp() {
   fi
 }
 
-main() {
-  if has_default_route; then
-    log "default route already present; no remediation needed"
-    exit 0
+recover_interface_if_needed() {
+  iface="$1"
+  ip link set dev "$iface" up >/dev/null 2>&1 || true
+  try_network_manager "$iface"
+  try_systemd_networkd "$iface"
+  try_dhcp "$iface"
+}
+
+disable_cloud_init_network_config() {
+  write_if_changed "$CLOUD_CFG_FILE" "network: {config: disabled}"
+}
+
+detect_primary_interface() {
+  iface="$(ip -o -4 route show to default 2>/dev/null | awk '{print $5}' | head -n1 || true)"
+
+  if [ -z "$iface" ]; then
+    for candidate in $(candidate_ifaces); do
+      recover_interface_if_needed "$candidate"
+      iface="$(ip -o -4 route show to default 2>/dev/null | awk '{print $5}' | head -n1 || true)"
+      [ -n "$iface" ] && break
+    done
   fi
 
-  for iface in $(candidate_ifaces); do
-    ip link set dev "$iface" up >/dev/null 2>&1 || true
-    try_network_manager "$iface"
-    try_systemd_networkd "$iface"
-    try_dhcp "$iface"
-    sleep 2
-    if has_default_route || has_global_address "$iface"; then
-      log "network remediation succeeded on $iface"
-      exit 0
-    fi
-  done
+  if [ -z "$iface" ]; then
+    iface="$(candidate_ifaces | head -n1 || true)"
+  fi
 
-  log "network remediation could not establish connectivity"
+  if [ -z "$iface" ]; then
+    error "Unable to detect primary network interface"
+    return 1
+  fi
+
+  PRIMARY_IFACE="$iface"
+  log "Detected primary interface: $PRIMARY_IFACE"
+  return 0
+}
+
+configure_systemd_resolved() {
+  if ! command -v systemctl >/dev/null 2>&1; then
+    error "systemctl not found; cannot configure systemd-resolved"
+    return 1
+  fi
+
+  set_or_append_kv "$RESOLVED_CONF" "DNS" "$DNS_PRIMARY_1 $DNS_PRIMARY_2"
+  set_or_append_kv "$RESOLVED_CONF" "FallbackDNS" "$DNS_FALLBACK"
+
+  if systemctl list-unit-files | grep -q '^systemd-resolved.service'; then
+    systemctl enable systemd-resolved.service >/dev/null 2>&1 || true
+    systemctl restart systemd-resolved.service
+    return 0
+  fi
+
+  warn "systemd-resolved.service not found"
+  return 1
+}
+
+ensure_resolv_conf() {
+  stub=/run/systemd/resolve/stub-resolv.conf
+  real=/run/systemd/resolve/resolv.conf
+
+  if [ -e "$stub" ]; then
+    if [ -e /etc/resolv.conf ] && [ ! -L /etc/resolv.conf ]; then
+      cp -a /etc/resolv.conf "/etc/resolv.conf.vmigrate.bak.$(date +%s)" || true
+    fi
+    ln -sfn "$stub" /etc/resolv.conf
+    log "Linked /etc/resolv.conf -> $stub"
+    return 0
+  fi
+
+  if [ -e "$real" ]; then
+    ln -sfn "$real" /etc/resolv.conf
+    log "Linked /etc/resolv.conf -> $real"
+    return 0
+  fi
+
+  write_if_changed /etc/resolv.conf "nameserver $DNS_PRIMARY_1
+nameserver $DNS_PRIMARY_2
+options edns0 trust-ad"
+}
+
+update_netplan_dns() {
+  if [ -z "$PRIMARY_IFACE" ]; then
+    error "PRIMARY_IFACE is empty"
+    return 1
+  fi
+
+  mkdir -p "$NETPLAN_DIR"
+  write_if_changed "$NETPLAN_FILE" "network:
+  version: 2
+  ethernets:
+    $PRIMARY_IFACE:
+      nameservers:
+        addresses: [$DNS_PRIMARY_1, $DNS_PRIMARY_2]"
+}
+
+apply_netplan_safely() {
+  if ! command -v netplan >/dev/null 2>&1; then
+    warn "netplan not installed; skipping"
+    return 0
+  fi
+
+  netplan generate
+  netplan apply
+}
+
+main() {
+  log "===== VMigrate network fix started ====="
+
+  run_step "Disable cloud-init network config" disable_cloud_init_network_config || true
+  run_step "Detect primary interface" detect_primary_interface || true
+  run_step "Configure systemd-resolved" configure_systemd_resolved || true
+  run_step "Ensure resolv.conf" ensure_resolv_conf || true
+  run_step "Write netplan DNS config" update_netplan_dns || true
+  run_step "Apply netplan" apply_netplan_safely || true
+
+  if [ "$FAIL_COUNT" -gt 0 ]; then
+    error "Completed with $FAIL_COUNT failed step(s)"
+    log "===== VMigrate network fix finished (FAILED) ====="
+    exit 1
+  fi
+
+  log "All steps completed successfully"
+  log "===== VMigrate network fix finished (OK) ====="
   exit 0
 }
 

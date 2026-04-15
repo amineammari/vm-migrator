@@ -8,6 +8,7 @@ import {
 } from '../api/openstack'
 import PanelState from '../components/PanelState'
 import StatusBadge from '../components/StatusBadge'
+import { Alert, Button, Card, PageHeader, Table } from '../components/ui'
 
 const POLL_INTERVAL_MS = 5000
 
@@ -18,6 +19,8 @@ function MigrationJobsPage() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [provisioningBusy, setProvisioningBusy] = useState(false)
+  const [tablePage, setTablePage] = useState(1)
+  const [tablePageSize, setTablePageSize] = useState(10)
   const openstackEndpointSessionId = Number(localStorage.getItem('active_openstack_endpoint_session_id')) || null
 
   useEffect(() => {
@@ -65,7 +68,7 @@ function MigrationJobsPage() {
     }
   }
 
-  const provisioningActive = ['QUEUED', 'RUNNING'].includes(provisioning?.state)
+  const provisioningActive = provisioning?.state === 'RUNNING'
   const jobStats = useMemo(() => {
     const total = jobs.length
     const active = jobs.filter((job) =>
@@ -75,26 +78,38 @@ function MigrationJobsPage() {
     const verified = jobs.filter((job) => job.status === 'VERIFIED').length
     return { total, active, failed, verified }
   }, [jobs])
+  const tableTotalPages = Math.max(1, Math.ceil(jobs.length / Math.max(1, tablePageSize)))
+  const pagedJobs = useMemo(() => {
+    return jobs.slice((tablePage - 1) * tablePageSize, tablePage * tablePageSize)
+  }, [jobs, tablePage, tablePageSize])
+
+  useEffect(() => {
+    setTablePage(1)
+  }, [jobs.length])
+
+  useEffect(() => {
+    if (tablePage > tableTotalPages) {
+      setTablePage(tableTotalPages)
+    }
+  }, [tablePage, tableTotalPages])
 
   return (
     <section>
-      <div className="page-header">
-        <div>
-          <h2>Migration Jobs Dashboard</h2>
-          <p>Live status of migration workflow states with auto-refresh.</p>
-        </div>
-        <div className="header-actions">
-          <button
-            className="primary-btn"
+      <PageHeader
+        eyebrow="Monitoring"
+        title="Migration Jobs Dashboard"
+        description="Live status of migration workflow states with auto-refresh."
+        actions={
+          <Button
             onClick={handleProvision}
             disabled={provisioningBusy || provisioningActive}
           >
             Provision OpenStack Infra
-          </button>
-        </div>
-      </div>
+          </Button>
+        }
+      />
 
-      {error && <div className="alert error">{error}</div>}
+      {error && <Alert>{error}</Alert>}
 
       <div className="stats-grid">
         <div className="stat-card">
@@ -129,14 +144,25 @@ function MigrationJobsPage() {
         </div>
       </div>
 
-      <div className="panel">
+      <Card>
         {loading ? (
           <PanelState title="Loading jobs" message="Fetching migration job queue..." />
         ) : jobs.length === 0 ? (
           <PanelState title="No jobs yet" message="Trigger migrations from VMware inventory to populate this table." />
         ) : (
-          <div className="table-wrap">
-            <table className="data-table">
+          <Table
+            pagination={{
+              page: tablePage,
+              pageSize: tablePageSize,
+              totalItems: jobs.length,
+              onPageChange: setTablePage,
+              onPageSizeChange: (nextPageSize) => {
+                setTablePageSize(nextPageSize)
+                setTablePage(1)
+              },
+              label: 'jobs',
+            }}
+          >
               <thead>
                 <tr>
                   <th>Job</th>
@@ -147,7 +173,7 @@ function MigrationJobsPage() {
                 </tr>
               </thead>
               <tbody>
-                {jobs.map((job) => (
+                {pagedJobs.map((job) => (
                   <tr key={job.id} className="vm-row">
                     <td>
                       <div className="vm-name-cell">
@@ -168,10 +194,9 @@ function MigrationJobsPage() {
                   </tr>
                 ))}
               </tbody>
-            </table>
-          </div>
+          </Table>
         )}
-      </div>
+      </Card>
     </section>
   )
 }

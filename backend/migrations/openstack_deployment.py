@@ -343,6 +343,7 @@ def ensure_uploaded_image(
     qcow2_path: str,
     image_name: str,
     disk_format: str = "qcow2",
+    image_properties: dict[str, Any] | None = None,
     existing_image_id: str | None = None,
     timeout_seconds: int = 900,
     poll_interval_seconds: int = 5,
@@ -367,20 +368,25 @@ def ensure_uploaded_image(
     # NOTE: `conn.image.upload_image(...)` is deprecated in openstacksdk and does not
     # accept a `filename=` argument (it expects `data=`). Using it will create a queued
     # image with a 0-byte backing file. Use `create_image(filename=...)` instead.
+    create_kwargs: dict[str, Any] = {
+        "filename": str(path),
+        "disk_format": disk_format,
+        "container_format": "bare",
+        "visibility": "private",
+        "wait": False,
+        "timeout": max(1, timeout_seconds),
+        "validate_checksum": False,
+    }
+    if isinstance(image_properties, dict):
+        for key, value in image_properties.items():
+            if isinstance(key, str) and key.strip() and value is not None:
+                create_kwargs[key.strip()] = value
+
     image = _retry_call(
         "image upload",
         retries,
         retry_delay_seconds,
-        lambda: conn.image.create_image(
-            image_name,
-            filename=str(path),
-            disk_format=disk_format,
-            container_format="bare",
-            visibility="private",
-            wait=False,
-            timeout=max(1, timeout_seconds),
-            validate_checksum=False,
-        ),
+        lambda: conn.image.create_image(image_name, **create_kwargs),
     )
 
     deadline = time.monotonic() + timeout_seconds
@@ -459,6 +465,15 @@ def ensure_server_booted_from_volume(
     if existing_by_name is not None:
         return existing_by_name.id
 
+    ensure_volume_bootable(
+        conn,
+        volume_id=boot_volume_id,
+        timeout_seconds=60,
+        poll_interval_seconds=3,
+        retries=retries,
+        retry_delay_seconds=retry_delay_seconds,
+    )
+
     network_payload = {"uuid": network_id}
     if fixed_ip:
         network_payload["fixed_ip"] = fixed_ip
@@ -486,6 +501,50 @@ def ensure_server_booted_from_volume(
     )
 
     return server.id
+
+
+def _volume_is_bootable(volume: Any) -> bool:
+    value = getattr(volume, "is_bootable", None)
+    if value is None:
+        value = getattr(volume, "bootable", None)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    if value is None:
+        return False
+    return bool(value)
+
+
+def ensure_volume_bootable(
+    conn,
+    *,
+    volume_id: str,
+    timeout_seconds: int = 60,
+    poll_interval_seconds: int = 3,
+    retries: int = 2,
+    retry_delay_seconds: int = 3,
+) -> None:
+    """Ensure a Cinder volume is marked bootable before server creation."""
+    volume = conn.block_storage.get_volume(volume_id)
+    if _volume_is_bootable(volume):
+        return
+
+    _retry_call(
+        "set volume bootable",
+        retries,
+        retry_delay_seconds,
+        lambda: conn.block_storage.set_volume_bootable(volume_id, True),
+    )
+
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        volume = conn.block_storage.get_volume(volume_id)
+        if _volume_is_bootable(volume):
+            return
+        time.sleep(max(1, poll_interval_seconds))
+
+    raise OpenStackDeploymentError(
+        f"Volume '{volume_id}' did not become bootable within {timeout_seconds}s."
+    )
 
 
 def _coerce_bool(value: Any, default: bool) -> bool:
@@ -566,6 +625,60 @@ def _security_group_rule_matches(rule: Any, spec: SecurityGroupRuleSpec) -> bool
     )
 
 
+def _ensure_security_group_rule(
+    conn,
+    *,
+    security_group_id: str,
+    spec: SecurityGroupRuleSpec,
+    retries: int,
+    retry_delay_seconds: int,
+) -> None:
+    rules = _list_security_group_rules(conn, security_group_id=security_group_id)
+    if any(_security_group_rule_matches(rule, spec) for rule in rules):
+        return
+
+    payload: dict[str, Any] = {
+        "security_group_id": security_group_id,
+        "direction": spec.direction,
+        "ether_type": spec.ether_type,
+    }
+    if spec.protocol:
+        payload["protocol"] = spec.protocol
+    if spec.port_range_min is not None:
+        payload["port_range_min"] = spec.port_range_min
+    if spec.port_range_max is not None:
+        payload["port_range_max"] = spec.port_range_max
+    if spec.remote_ip_prefix:
+        payload["remote_ip_prefix"] = spec.remote_ip_prefix
+
+    last_exc: Exception | None = None
+    for idx in range(max(1, retries)):
+        try:
+            created = conn.network.create_security_group_rule(**payload)
+            if created is not None:
+                rules.append(created)
+            return
+        except os_exceptions.ConflictException as exc:
+            # Treat "already exists" conflicts as success to avoid rollback on racing workers.
+            message = str(exc).lower()
+            if "already exists" in message:
+                return
+            # If we got a different conflict, re-check before retrying.
+            rules = _list_security_group_rules(conn, security_group_id=security_group_id)
+            if any(_security_group_rule_matches(rule, spec) for rule in rules):
+                return
+            last_exc = exc
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+
+        if idx < retries - 1:
+            time.sleep(max(0, retry_delay_seconds))
+
+    raise OpenStackDeploymentError(
+        f"security group rule create failed after {retries} attempts: {last_exc}"
+    ) from last_exc
+
+
 def ensure_server_access_baseline(
     conn,
     *,
@@ -592,28 +705,14 @@ def ensure_server_access_baseline(
             ),
         )
 
-    rules = _list_security_group_rules(conn, security_group_id=str(getattr(security_group, "id", "") or ""))
+    security_group_id = str(getattr(security_group, "id", "") or "")
     for spec in _baseline_security_group_rule_specs():
-        if any(_security_group_rule_matches(rule, spec) for rule in rules):
-            continue
-        payload: dict[str, Any] = {
-            "security_group_id": security_group.id,
-            "direction": spec.direction,
-            "ether_type": spec.ether_type,
-        }
-        if spec.protocol:
-            payload["protocol"] = spec.protocol
-        if spec.port_range_min is not None:
-            payload["port_range_min"] = spec.port_range_min
-        if spec.port_range_max is not None:
-            payload["port_range_max"] = spec.port_range_max
-        if spec.remote_ip_prefix:
-            payload["remote_ip_prefix"] = spec.remote_ip_prefix
-        _retry_call(
-            "security group rule create",
-            retries,
-            retry_delay_seconds,
-            lambda payload=payload: conn.network.create_security_group_rule(**payload),
+        _ensure_security_group_rule(
+            conn,
+            security_group_id=security_group_id,
+            spec=spec,
+            retries=retries,
+            retry_delay_seconds=retry_delay_seconds,
         )
 
     server = conn.compute.get_server(server_id)
@@ -1020,6 +1119,41 @@ def attach_volume_to_server(
         ),
     )
     return "attached"
+
+
+def wait_for_volume_attachment(
+    conn,
+    *,
+    server_id: str,
+    volume_id: str,
+    timeout_seconds: int = 180,
+    poll_interval_seconds: int = 5,
+) -> str:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        server = conn.compute.get_server(server_id)
+        attached = getattr(server, "attached_volumes", None) or []
+        attached_ids = {
+            str(item.get("id"))
+            for item in attached
+            if isinstance(item, dict) and isinstance(item.get("id"), str)
+        }
+        volume = conn.block_storage.get_volume(volume_id)
+        status = str(getattr(volume, "status", "")).lower()
+
+        if status in {"error", "error_extending", "error_deleting", "error_restoring", "error_managing"}:
+            raise OpenStackDeploymentError(
+                f"Volume '{volume_id}' entered error state during attach: {status}."
+            )
+
+        if volume_id in attached_ids and status in {"in-use", "in_use"}:
+            return status
+
+        time.sleep(max(1, poll_interval_seconds))
+
+    raise OpenStackDeploymentError(
+        f"Timed out waiting for volume '{volume_id}' to attach to server '{server_id}'."
+    )
 
 
 def verify_server_active(

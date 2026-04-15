@@ -175,6 +175,9 @@ GUEST_NETWORK_DISABLE_CLOUD_INIT_NETWORK_CONFIG = env.bool(
     default=False,
 )
 
+# If true, migration fails when OS detection cannot classify the guest as a supported family.
+MIGRATION_FAIL_ON_UNSUPPORTED_OS = env.bool("MIGRATION_FAIL_ON_UNSUPPORTED_OS", default=False)
+
 # ESXi conversion guardrails
 VMWARE_REQUIRE_NO_SNAPSHOTS = env.bool("VMWARE_REQUIRE_NO_SNAPSHOTS", default=True)
 

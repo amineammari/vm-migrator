@@ -3,6 +3,7 @@ import { Link, useParams } from 'react-router-dom'
 import { fetchMigrationJob } from '../api/migrations'
 import PanelState from '../components/PanelState'
 import StatusBadge from '../components/StatusBadge'
+import { Alert, Button, Card, PageHeader } from '../components/ui'
 
 function JobDetailPage() {
   const { id } = useParams()
@@ -30,24 +31,25 @@ function JobDetailPage() {
 
   return (
     <section>
-      <div className="page-header">
-        <div>
-          <h2>Migration Job Detail</h2>
-          <p>Job #{id}</p>
-        </div>
-        <div className="header-actions">
-          <button className="secondary-btn" onClick={loadJob} disabled={loading}>
+      <PageHeader
+        eyebrow="Job detail"
+        title="Migration Job Detail"
+        description={`Job #${id}`}
+        actions={
+          <>
+          <Button variant="secondary" onClick={loadJob} disabled={loading}>
             Refresh
-          </button>
-          <Link className="secondary-btn" to="/migrations">
+          </Button>
+          <Button as={Link} variant="secondary" to="/migration-jobs">
             Back
-          </Link>
-        </div>
-      </div>
+          </Button>
+          </>
+        }
+      />
 
-      {error && <div className="alert error">{error}</div>}
+      {error && <Alert>{error}</Alert>}
 
-      <div className="panel">
+      <Card>
         {loading ? (
           <PanelState title="Loading job" message="Fetching migration metadata..." />
         ) : !job ? (
@@ -96,7 +98,7 @@ function JobDetailPage() {
             </section>
           </>
         )}
-      </div>
+      </Card>
     </section>
   )
 }

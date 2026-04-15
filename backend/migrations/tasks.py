@@ -42,6 +42,7 @@ from .models import (
     VmwareEndpointSession,
 )
 from .network_remediation import NetworkRemediationError, apply_guest_network_remediation
+from .os_profile import detect_os_profile, get_os_handler
 from .openstack_deployment import (
     OpenStackDeploymentError,
     attach_volume_to_server,
@@ -62,6 +63,7 @@ from .openstack_deployment import (
     map_vmware_to_flavor,
     select_default_network,
     verify_server_active,
+    wait_for_volume_attachment,
 )
 from .terraform_runner import TerraformRunner, TerraformRunnerError
 from .snapshot_manager import SnapshotError, create_vm_snapshot
@@ -204,6 +206,11 @@ def _ensure_libguestfs_kernel_readable() -> None:
     configured_kernel = os.getenv("SUPERMIN_KERNEL", "").strip()
     if configured_kernel:
         kernel = Path(configured_kernel).expanduser()
+        if not kernel.exists():
+            raise ConversionPlanningError(
+                "Configured SUPERMIN_KERNEL does not exist: "
+                f"{kernel}. Update SUPERMIN_KERNEL or remove it to use the active kernel."
+            )
     else:
         release = os.uname().release
         kernel = Path("/boot") / f"vmlinuz-{release}"
@@ -545,6 +552,14 @@ def _filter_execution_to_selected_disks(
         single = execution.get("output_qcow2_path")
         output_qcow2_paths = [single] if isinstance(single, str) and single.strip() else []
     if not output_qcow2_paths:
+        return execution
+
+    if not selected_disk_indexes:
+        return execution
+
+    max_index = max(selected_disk_indexes) if selected_disk_indexes else -1
+    if max_index >= len(output_qcow2_paths) and len(output_qcow2_paths) == len(selected_disk_indexes):
+        # Output list already reflects the selected disks; avoid trimming further.
         return execution
 
     filtered_indexes = [idx for idx in selected_disk_indexes if 0 <= idx < len(output_qcow2_paths)]
@@ -1261,6 +1276,17 @@ def _build_base_conversion_metadata(
     return {
         "selected_source": discovered_vm.source,
         "selected_vmware_endpoint_session_id": discovered_vm.vmware_endpoint_session_id,
+        "os_profile": {
+            "family": "unknown",
+            "distro": "unknown",
+            "display_name": "Unknown OS",
+            "package_manager": "unknown",
+            "connection_method": "unknown",
+            "detection_source": "fallback",
+            "confidence": "low",
+            "supported": False,
+            "notes": ["OS detection is pending conversion/runtime analysis"],
+        },
         "conversion": {
             "mode": mode,
             "command": plan.command,
@@ -1551,6 +1577,22 @@ def _run_openstack_deployment(job: MigrationJob, discovered_vm: DiscoveredVM) ->
     conn = connect_openstack(cloud=cloud, auth_overrides=auth_overrides)
 
     os_meta = metadata.get("openstack", {}) if isinstance(metadata.get("openstack"), dict) else {}
+    os_profile = metadata.get("os_profile") if isinstance(metadata.get("os_profile"), dict) else {}
+    image_properties = None
+    if os_profile:
+        image_properties = {
+            "vmigrate_os_family": str(os_profile.get("family", "unknown") or "unknown"),
+            "vmigrate_os_distro": str(os_profile.get("distro", "unknown") or "unknown"),
+            "vmigrate_os_name": str(os_profile.get("display_name", "Unknown OS") or "Unknown OS"),
+            "vmigrate_os_detection_source": str(os_profile.get("detection_source", "fallback") or "fallback"),
+            "vmigrate_os_detection_confidence": str(os_profile.get("confidence", "low") or "low"),
+        }
+        os_type = str(os_profile.get("family", "") or "").strip().lower()
+        if os_type in {"linux", "windows"}:
+            image_properties["os_type"] = os_type
+        os_distro = str(os_profile.get("distro", "") or "").strip().lower()
+        if os_distro and os_distro != "unknown":
+            image_properties["os_distro"] = os_distro
     if isinstance(selected_openstack_endpoint_session_id, int):
         os_meta["selected_openstack_endpoint_session_id"] = selected_openstack_endpoint_session_id
     names = build_openstack_names(job.vm_name, job.id)
@@ -1589,6 +1631,7 @@ def _run_openstack_deployment(job: MigrationJob, discovered_vm: DiscoveredVM) ->
             qcow2_path=qcow2_path,
             image_name=image_name,
             disk_format=output_disk_format,
+            image_properties=image_properties,
             existing_image_id=existing_image_id,
             timeout_seconds=int(getattr(settings, "OPENSTACK_IMAGE_UPLOAD_TIMEOUT", 900)),
             poll_interval_seconds=int(getattr(settings, "OPENSTACK_IMAGE_UPLOAD_POLL_INTERVAL", 5)),
@@ -1734,6 +1777,13 @@ def _run_openstack_deployment(job: MigrationJob, discovered_vm: DiscoveredVM) ->
             retries=int(getattr(settings, "OPENSTACK_API_RETRIES", 2)),
             retry_delay_seconds=int(getattr(settings, "OPENSTACK_API_RETRY_DELAY", 3)),
         )
+        wait_for_volume_attachment(
+            conn,
+            server_id=server_id,
+            volume_id=volume_id,
+            timeout_seconds=int(getattr(settings, "OPENSTACK_VOLUME_ATTACH_TIMEOUT", 180)),
+            poll_interval_seconds=int(getattr(settings, "OPENSTACK_VOLUME_ATTACH_POLL_INTERVAL", 5)),
+        )
         attached_volumes.append(
             {
                 "index": idx,
@@ -1782,6 +1832,13 @@ def _run_openstack_deployment(job: MigrationJob, discovered_vm: DiscoveredVM) ->
             volume_id=volume_id,
             retries=int(getattr(settings, "OPENSTACK_API_RETRIES", 2)),
             retry_delay_seconds=int(getattr(settings, "OPENSTACK_API_RETRY_DELAY", 3)),
+        )
+        wait_for_volume_attachment(
+            conn,
+            server_id=server_id,
+            volume_id=volume_id,
+            timeout_seconds=int(getattr(settings, "OPENSTACK_VOLUME_ATTACH_TIMEOUT", 180)),
+            poll_interval_seconds=int(getattr(settings, "OPENSTACK_VOLUME_ATTACH_POLL_INTERVAL", 5)),
         )
         attached_volumes.append(
             {
@@ -2210,11 +2267,57 @@ def start_migration(job_id: int) -> dict[str, Any]:
                 metadata["conversion"]["execution"] = {"state": "succeeded", **exec_result}
 
             current_execution = metadata.get("conversion", {}).get("execution", {})
+            os_profile = detect_os_profile(discovered_vm, current_execution if isinstance(current_execution, dict) else None)
+            metadata["os_profile"] = {
+                "family": os_profile.family,
+                "distro": os_profile.distro,
+                "display_name": os_profile.display_name,
+                "package_manager": os_profile.package_manager,
+                "connection_method": os_profile.connection_method,
+                "detection_source": os_profile.detection_source,
+                "confidence": os_profile.confidence,
+                "supported": os_profile.supported,
+                "notes": os_profile.notes,
+            }
+            os_handler = get_os_handler(os_profile)
+            logger.info(
+                "migration.os.detected",
+                extra={
+                    "job_id": job.id,
+                    "vm_name": job.vm_name,
+                    "family": os_profile.family,
+                    "distro": os_profile.distro,
+                    "source": os_profile.detection_source,
+                    "confidence": os_profile.confidence,
+                    "supported": os_profile.supported,
+                },
+            )
+
+            if not os_profile.supported and bool(getattr(settings, "MIGRATION_FAIL_ON_UNSUPPORTED_OS", False)):
+                raise ConversionPlanningError(
+                    f"Unsupported/unknown guest OS for VM '{job.vm_name}'. "
+                    "Enable detection metadata or set MIGRATION_FAIL_ON_UNSUPPORTED_OS=false."
+                )
+
             remediation_enabled = bool(getattr(settings, "ENABLE_GUEST_NETWORK_REMEDIATION", True))
             remediation_applied = bool(current_execution.get("guest_network_remediation_applied"))
-            if remediation_enabled and not remediation_applied:
-                remediation_paths = current_execution.get("output_qcow2_paths")
-                if not isinstance(remediation_paths, list) or not remediation_paths:
+            if remediation_enabled and not remediation_applied and os_handler.should_apply_guest_network_remediation():
+                remediation_paths: list[str] = []
+                disk_analysis = current_execution.get("disk_analysis")
+                if isinstance(disk_analysis, list):
+                    for item in disk_analysis:
+                        if not isinstance(item, dict):
+                            continue
+                        if not item.get("has_operating_system"):
+                            continue
+                        path = item.get("path")
+                        if isinstance(path, str) and path.strip():
+                            remediation_paths.append(path)
+                if not remediation_paths:
+                    raw_paths = current_execution.get("output_qcow2_paths")
+                    if isinstance(raw_paths, list):
+                        remediation_paths = [str(p) for p in raw_paths if isinstance(p, str) and p.strip()]
+                if not remediation_paths:
                     single_output = current_execution.get("output_qcow2_path")
                     remediation_paths = [single_output] if isinstance(single_output, str) and single_output.strip() else []
                 remediation_report = apply_guest_network_remediation(
@@ -2226,6 +2329,15 @@ def start_migration(job_id: int) -> dict[str, Any]:
                 )
                 metadata["conversion"]["guest_network_remediation"] = remediation_report
                 metadata["conversion"]["execution"]["guest_network_remediation_applied"] = True
+            elif remediation_enabled and not remediation_applied:
+                metadata["conversion"]["guest_network_remediation"] = {
+                    "ok": True,
+                    "skipped": True,
+                    "reason": os_handler.remediation_reason(),
+                    "detected_os_family": os_profile.family,
+                    "detected_os_distro": os_profile.distro,
+                }
+                metadata["conversion"]["execution"]["guest_network_remediation_applied"] = False
 
             if bool(getattr(settings, "ENABLE_ARTIFACT_BACKUP", False)) and not already_converted:
                 try:

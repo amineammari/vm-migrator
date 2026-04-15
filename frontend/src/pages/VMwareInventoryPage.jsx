@@ -12,13 +12,13 @@ import {
 import {
   closeOpenstackEndpointSession,
   connectOpenstackEndpoint,
-  createOpenStackNetwork,
   fetchOpenStackNetworkCatalog,
   fetchOpenStackFlavors,
   fetchOpenstackEndpointSession,
   testOpenstackEndpoint,
 } from '../api/openstack'
 import PanelState from '../components/PanelState'
+import { Alert, Badge, Button, Card, PageHeader, Table } from '../components/ui'
 
 function VMwareInventoryPage() {
   const [vms, setVMs] = useState([])
@@ -41,6 +41,10 @@ function VMwareInventoryPage() {
   const [showVmwareModal, setShowVmwareModal] = useState(false)
   const [showOpenstackModal, setShowOpenstackModal] = useState(false)
   const [expandedVmKey, setExpandedVmKey] = useState('')
+  const [vmSearch, setVmSearch] = useState('')
+  const [powerFilter, setPowerFilter] = useState('all')
+  const [tablePage, setTablePage] = useState(1)
+  const [tablePageSize, setTablePageSize] = useState(10)
 
   const [vmwareForm, setVmwareForm] = useState({
     label: '',
@@ -73,24 +77,42 @@ function VMwareInventoryPage() {
   const [openstackConnecting, setOpenstackConnecting] = useState(false)
   const [openstackTestPassed, setOpenstackTestPassed] = useState(false)
   const [openstackTestMessage, setOpenstackTestMessage] = useState('')
-  const [networkCreateForm, setNetworkCreateForm] = useState({
-    name: '',
-    subnet_name: '',
-    cidr: '192.168.100.0/24',
-    gateway_ip: '',
-    allocation_pool_start: '',
-    allocation_pool_end: '',
-    dns_nameservers: '8.8.8.8, 1.1.1.1',
-    enable_dhcp: true,
-  })
-  const [networkCreateBusy, setNetworkCreateBusy] = useState(false)
-  const [networkCreateMessage, setNetworkCreateMessage] = useState('')
-  const [networkCreateError, setNetworkCreateError] = useState('')
-
   const selectedVMs = useMemo(
     () => vms.filter((vm) => selectedKeys.has(makeKey(vm))),
     [vms, selectedKeys],
   )
+  const visibleVMs = useMemo(() => {
+    const search = vmSearch.trim().toLowerCase()
+    return vms.filter((vm) => {
+      const metadata = vm?.metadata || {}
+      const searchable = [
+        vm?.name,
+        vm?.source,
+        vm?.guest_ip,
+        vm?.power_state,
+        metadata?.guest_full_name,
+        metadata?.host_name,
+        metadata?.cluster_name,
+      ].join(' ').toLowerCase()
+      const matchesSearch = !search || searchable.includes(search)
+      const matchesPower = powerFilter === 'all' || String(vm?.power_state || '').toLowerCase() === powerFilter
+      return matchesSearch && matchesPower
+    })
+  }, [powerFilter, vmSearch, vms])
+  const tableTotalPages = Math.max(1, Math.ceil(visibleVMs.length / Math.max(1, tablePageSize)))
+  const pagedVisibleVMs = useMemo(() => {
+    return visibleVMs.slice((tablePage - 1) * tablePageSize, tablePage * tablePageSize)
+  }, [visibleVMs, tablePage, tablePageSize])
+
+  useEffect(() => {
+    setTablePage(1)
+  }, [vmSearch, powerFilter, visibleVMs.length])
+
+  useEffect(() => {
+    if (tablePage > tableTotalPages) {
+      setTablePage(tableTotalPages)
+    }
+  }, [tablePage, tableTotalPages])
 
   useEffect(() => {
     let mounted = true
@@ -399,60 +421,17 @@ function VMwareInventoryPage() {
       setNetworks([])
       setExternalNetworks([])
       setAvailableFloatingIps([])
-      setNetworkCreateMessage('')
-      setNetworkCreateError('')
-    }
-  }
-
-  async function handleCreateNetwork() {
-    if (!activeOpenstackEndpoint?.id) {
-      setNetworkCreateError('Connect an OpenStack endpoint first.')
-      return
-    }
-
-    setNetworkCreateBusy(true)
-    setError('')
-    setOpenstackError('')
-    setNetworkCreateMessage('')
-    setNetworkCreateError('')
-    try {
-      const res = await createOpenStackNetwork({
-        openstack_endpoint_session_id: activeOpenstackEndpoint.id,
-        name: networkCreateForm.name,
-        subnet_name: networkCreateForm.subnet_name,
-        cidr: networkCreateForm.cidr,
-        gateway_ip: networkCreateForm.gateway_ip,
-        allocation_pool_start: networkCreateForm.allocation_pool_start,
-        allocation_pool_end: networkCreateForm.allocation_pool_end,
-        enable_dhcp: networkCreateForm.enable_dhcp,
-        dns_nameservers: String(networkCreateForm.dns_nameservers || '')
-          .split(',')
-          .map((item) => item.trim())
-          .filter(Boolean),
-      })
-      const refreshed = await fetchOpenStackNetworkCatalog(activeOpenstackEndpoint.id)
-      setNetworks(refreshed?.items || [])
-      setExternalNetworks(refreshed?.external_networks || [])
-      setAvailableFloatingIps(refreshed?.available_floating_ips || [])
-      setNetworkCreateMessage(res?.message || 'Network created successfully.')
-      setNetworkCreateForm((current) => ({
-        ...current,
-        name: '',
-        subnet_name: '',
-      }))
-    } catch (err) {
-      setNetworkCreateError(err.message || 'Failed to create OpenStack network.')
-    } finally {
-      setNetworkCreateBusy(false)
     }
   }
 
   return (
     <section>
-      <div className="page-header">
-        <div>
-          <h2>VMware Inventory</h2>
-          <p>Select discovered VMs and start migration jobs.</p>
+      <PageHeader
+        eyebrow="VM List"
+        title="Virtual Machines"
+        description={
+          <>
+            Select discovered VMs and start migration jobs.
           <div className="endpoint-summary">
             <span>
               VMware: {activeVmwareEndpoint ? `${activeVmwareEndpoint.host}:${activeVmwareEndpoint.port}` : 'Non connecte'}
@@ -461,149 +440,46 @@ function VMwareInventoryPage() {
               OpenStack: {activeOpenstackEndpoint ? `${activeOpenstackEndpoint.project_name} @ ${activeOpenstackEndpoint.auth_url}` : 'Non connecte'}
             </span>
           </div>
-        </div>
-        <div className="header-actions">
-          <button className="secondary-btn" onClick={() => setShowVmwareModal(true)} disabled={submitting}>
+          </>
+        }
+        actions={
+          <>
+          <Button variant="secondary" onClick={() => setShowVmwareModal(true)} disabled={submitting}>
             Connect ESXi
-          </button>
-          <button
-            className="secondary-btn"
+          </Button>
+          <Button
+            variant="secondary"
             onClick={handleVmwareDisconnect}
             disabled={submitting || !activeVmwareEndpoint}
           >
             Disconnect ESXi
-          </button>
-          <button className="secondary-btn" onClick={() => setShowOpenstackModal(true)} disabled={submitting}>
+          </Button>
+          <Button variant="secondary" onClick={() => setShowOpenstackModal(true)} disabled={submitting}>
             Connect OpenStack
-          </button>
-          <button
-            className="secondary-btn"
+          </Button>
+          <Button
+            variant="secondary"
             onClick={handleOpenstackDisconnect}
             disabled={submitting || !activeOpenstackEndpoint}
           >
             Disconnect OpenStack
-          </button>
-          <button className="secondary-btn" onClick={refreshFromESXi} disabled={loading || refreshing || submitting || !activeVmwareEndpoint}>
+          </Button>
+          <Button variant="secondary" onClick={refreshFromESXi} disabled={loading || refreshing || submitting || !activeVmwareEndpoint}>
             {refreshing ? 'Refreshing...' : 'Refresh'}
-          </button>
-        </div>
-      </div>
+          </Button>
+          </>
+        }
+      />
 
-      {error && <div className="alert error">{error}</div>}
-      {openstackError && <div className="alert error">{openstackError}</div>}
+      {error && <Alert>{error}</Alert>}
+      {openstackError && <Alert>{openstackError}</Alert>}
       {result && (
-        <div className="alert success">
+        <Alert tone="success">
           Created: {result.created_jobs?.length || 0}, Skipped: {result.skipped_jobs?.length || 0}
-        </div>
+        </Alert>
       )}
 
-      <div className="panel">
-        {!activeOpenstackEndpoint ? (
-          <PanelState title="No OpenStack connection" message="Connect OpenStack to create a network and subnet for migrated VMs." />
-        ) : (
-          <>
-            <div className="toolbar">
-              <p>Create an OpenStack network and subnet in the active project.</p>
-              <button
-                className="secondary-btn"
-                onClick={async () => {
-                  setError('')
-                  setOpenstackError('')
-                  setNetworkCreateError('')
-                  const refreshed = await fetchOpenStackNetworkCatalog(activeOpenstackEndpoint.id)
-                  setNetworks(refreshed?.items || [])
-                  setExternalNetworks(refreshed?.external_networks || [])
-                  setAvailableFloatingIps(refreshed?.available_floating_ips || [])
-                }}
-                disabled={networkCreateBusy}
-              >
-                Refresh Networks
-              </button>
-            </div>
-            <div className="spec-form-grid">
-              <article className="spec-card">
-                <h4>New Network</h4>
-                <p>The subnet is created together with the network so it can be selected right away during migration.</p>
-                <div className="spec-fields">
-                  <label>
-                    <span>Network name</span>
-                    <input
-                      value={networkCreateForm.name}
-                      onChange={(e) => setNetworkCreateForm((v) => ({ ...v, name: e.target.value }))}
-                      placeholder="private-migration"
-                    />
-                  </label>
-                  <label>
-                    <span>Subnet name</span>
-                    <input
-                      value={networkCreateForm.subnet_name}
-                      onChange={(e) => setNetworkCreateForm((v) => ({ ...v, subnet_name: e.target.value }))}
-                      placeholder="private-migration-subnet"
-                    />
-                  </label>
-                  <label>
-                    <span>CIDR</span>
-                    <input
-                      value={networkCreateForm.cidr}
-                      onChange={(e) => setNetworkCreateForm((v) => ({ ...v, cidr: e.target.value }))}
-                      placeholder="192.168.100.0/24"
-                    />
-                  </label>
-                  <label>
-                    <span>Gateway IP</span>
-                    <input
-                      value={networkCreateForm.gateway_ip}
-                      onChange={(e) => setNetworkCreateForm((v) => ({ ...v, gateway_ip: e.target.value }))}
-                      placeholder="192.168.100.1"
-                    />
-                  </label>
-                  <label>
-                    <span>Allocation start</span>
-                    <input
-                      value={networkCreateForm.allocation_pool_start}
-                      onChange={(e) => setNetworkCreateForm((v) => ({ ...v, allocation_pool_start: e.target.value }))}
-                      placeholder="192.168.100.50"
-                    />
-                  </label>
-                  <label>
-                    <span>Allocation end</span>
-                    <input
-                      value={networkCreateForm.allocation_pool_end}
-                      onChange={(e) => setNetworkCreateForm((v) => ({ ...v, allocation_pool_end: e.target.value }))}
-                      placeholder="192.168.100.200"
-                    />
-                  </label>
-                  <label className="span-2">
-                    <span>DNS nameservers</span>
-                    <input
-                      value={networkCreateForm.dns_nameservers}
-                      onChange={(e) => setNetworkCreateForm((v) => ({ ...v, dns_nameservers: e.target.value }))}
-                      placeholder="8.8.8.8, 1.1.1.1"
-                    />
-                  </label>
-                  <label className="checkbox-line span-2">
-                    <input
-                      type="checkbox"
-                      checked={networkCreateForm.enable_dhcp}
-                      onChange={(e) => setNetworkCreateForm((v) => ({ ...v, enable_dhcp: e.target.checked }))}
-                    />
-                    <span>Enable DHCP on subnet</span>
-                  </label>
-                </div>
-                <div className="modal-actions">
-                  <button className="primary-btn" onClick={handleCreateNetwork} disabled={networkCreateBusy}>
-                    {networkCreateBusy ? 'Creating...' : 'Create Network'}
-                  </button>
-                </div>
-                {networkCreateError && <div className="alert error">{networkCreateError}</div>}
-                {networkCreateMessage && <div className="alert success">{networkCreateMessage}</div>}
-              </article>
-            </div>
-          </>
-        )}
-      </div>
-
-      <div className="panel">
+      <Card>
         {!activeVmwareEndpoint ? (
           <PanelState title="No ESXi connection" message="Open Connect ESXi and test credentials before loading inventory." />
         ) : loading ? (
@@ -614,13 +490,32 @@ function VMwareInventoryPage() {
           <>
             <div className="toolbar">
               <p>{selectedVMs.length} selected</p>
-              <button
-                className="primary-btn"
+              <Button
                 onClick={migrateSelected}
                 disabled={!selectedVMs.length || submitting || !activeOpenstackEndpoint}
               >
                 {submitting ? 'Submitting...' : 'Migrate selected VMs'}
-              </button>
+              </Button>
+            </div>
+
+            <div className="filter-bar vm-filter-bar" role="search">
+              <label>
+                <span>Search VMs</span>
+                <input
+                  value={vmSearch}
+                  onChange={(event) => setVmSearch(event.target.value)}
+                  placeholder="name, OS, host, cluster"
+                />
+              </label>
+              <label>
+                <span>Power state</span>
+                <select value={powerFilter} onChange={(event) => setPowerFilter(event.target.value)}>
+                  <option value="all">All states</option>
+                  <option value="poweredon">Powered on</option>
+                  <option value="poweredoff">Powered off</option>
+                  <option value="suspended">Suspended</option>
+                </select>
+              </label>
             </div>
 
             {!!selectedVMs.length && (
@@ -838,8 +733,19 @@ function VMwareInventoryPage() {
               </div>
             )}
 
-            <div className="table-wrap">
-              <table className="data-table">
+            <Table
+              pagination={{
+                page: tablePage,
+                pageSize: tablePageSize,
+                totalItems: visibleVMs.length,
+                onPageChange: setTablePage,
+                onPageSizeChange: (nextPageSize) => {
+                  setTablePageSize(nextPageSize)
+                  setTablePage(1)
+                },
+                label: 'VMs',
+              }}
+            >
                 <thead>
                   <tr>
                     <th></th>
@@ -856,7 +762,7 @@ function VMwareInventoryPage() {
                   </tr>
                 </thead>
                 <tbody>
-                  {vms.map((vm) => {
+                  {pagedVisibleVMs.map((vm) => {
                   const key = makeKey(vm)
                   const checked = selectedKeys.has(key)
                   const expanded = expandedVmKey === key
@@ -888,21 +794,22 @@ function VMwareInventoryPage() {
                             <span>{metadata?.vmx_datastore_path || metadata?.instance_uuid || '-'}</span>
                           </div>
                         </td>
-                        <td><span className="pill neutral">{vm.source}</span></td>
+                        <td><Badge tone="info">{vm.source}</Badge></td>
                         <td>{guestOs}</td>
                         <td>{ip}</td>
                         <td>{vm.cpu ?? '-'}</td>
                         <td>{vm.ram ?? '-'}</td>
                         <td>{storageValue}</td>
                         <td>{`${hostValue}${clusterValue}`}</td>
-                        <td><span className={`pill ${powerClass(vm.power_state)}`}>{vm.power_state || '-'}</span></td>
+                        <td><Badge tone={powerTone(vm.power_state)}>{vm.power_state || '-'}</Badge></td>
                         <td>
-                          <button
-                            className="secondary-btn slim-btn"
+                          <Button
+                            variant="secondary"
+                            className="slim-btn"
                             onClick={() => setExpandedVmKey((current) => (current === key ? '' : key))}
                           >
                             {expanded ? 'Hide' : 'View'}
-                          </button>
+                          </Button>
                         </td>
                       </tr>
                       {expanded && (
@@ -916,11 +823,10 @@ function VMwareInventoryPage() {
                   )
                   })}
                 </tbody>
-              </table>
-            </div>
+            </Table>
           </>
         )}
-      </div>
+      </Card>
 
       {showVmwareModal && (
         <div className="modal-backdrop" onClick={() => setShowVmwareModal(false)}>
@@ -963,19 +869,18 @@ function VMwareInventoryPage() {
               </label>
             </div>
             {vmwareTestMessage && (
-              <div className={`alert ${vmwareTestPassed ? 'success' : 'error'}`}>{vmwareTestMessage}</div>
+              <Alert tone={vmwareTestPassed ? 'success' : 'error'}>{vmwareTestMessage}</Alert>
             )}
             <div className="modal-actions">
-              <button className="secondary-btn" onClick={handleVmwareTest} disabled={vmwareTesting || vmwareConnecting}>
+              <Button variant="secondary" onClick={handleVmwareTest} disabled={vmwareTesting || vmwareConnecting}>
                 {vmwareTesting ? 'Testing...' : 'Test'}
-              </button>
-              <button
-                className="primary-btn"
+              </Button>
+              <Button
                 onClick={handleVmwareConnect}
                 disabled={!vmwareTestPassed || vmwareTesting || vmwareConnecting}
               >
                 {vmwareConnecting ? 'Connecting...' : 'Connect'}
-              </button>
+              </Button>
             </div>
           </div>
         </div>
@@ -1043,19 +948,18 @@ function VMwareInventoryPage() {
               </label>
             </div>
             {openstackTestMessage && (
-              <div className={`alert ${openstackTestPassed ? 'success' : 'error'}`}>{openstackTestMessage}</div>
+              <Alert tone={openstackTestPassed ? 'success' : 'error'}>{openstackTestMessage}</Alert>
             )}
             <div className="modal-actions">
-              <button className="secondary-btn" onClick={handleOpenstackTest} disabled={openstackTesting || openstackConnecting}>
+              <Button variant="secondary" onClick={handleOpenstackTest} disabled={openstackTesting || openstackConnecting}>
                 {openstackTesting ? 'Testing...' : 'Test'}
-              </button>
-              <button
-                className="primary-btn"
+              </Button>
+              <Button
                 onClick={handleOpenstackConnect}
                 disabled={!openstackTestPassed || openstackTesting || openstackConnecting}
               >
                 {openstackConnecting ? 'Connecting...' : 'Connect'}
-              </button>
+              </Button>
             </div>
           </div>
         </div>
@@ -1495,10 +1399,10 @@ function formatDateTime(value) {
   return date.toLocaleString()
 }
 
-function powerClass(value) {
+function powerTone(value) {
   const normalized = String(value || '').toLowerCase()
   if (normalized.includes('on')) return 'success'
-  if (normalized.includes('off')) return 'neutral'
+  if (normalized.includes('off')) return 'info'
   return 'warning'
 }
 
