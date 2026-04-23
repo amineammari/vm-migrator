@@ -4,6 +4,7 @@ import { useAuth } from '../contexts/useAuth'
 
 const NAV_ITEMS = [
   { to: '/dashboard', label: 'Dashboard', icon: 'D' },
+  { to: '/infrastructure', label: 'Infrastructure', icon: 'I' },
   { to: '/inventory', label: 'Migrate VMs', icon: 'V' },
   { to: '/migration-jobs', label: 'Monitoring', icon: 'J' },
   { to: '/logs', label: 'Logs', icon: 'L' },

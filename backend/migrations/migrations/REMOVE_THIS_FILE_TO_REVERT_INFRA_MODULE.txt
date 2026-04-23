@@ -1,0 +1,7 @@
+Delete 0011_openstacknetwork_openstackproject_openstackrouter_and_more.py to fully revert the OpenStack Infra Management module database changes.
+
+You can do this safely if you want to remove all infra-related models and tables.
+
+After deleting, run:
+
+python backend/manage.py migrate migrations 0010

@@ -19,6 +19,46 @@ _CLOUD_INIT_DISABLE_PATH = "/etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
 
 
 def render_network_heal_script() -> str:
+
+    return """#!/bin/sh
+set -u
+set -o pipefail
+
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+LOG_FILE=/var/log/vmigrate-network-fix.log
+CLOUD_CFG_FILE=/etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
+RESOLVED_CONF=/etc/systemd/resolved.conf
+NETPLAN_DIR=/etc/netplan
+NETPLAN_FILE=/etc/netplan/99-vmigrate-dns.yaml
+
+DNS_PRIMARY_1=8.8.8.8
+DNS_PRIMARY_2=1.1.1.1
+DNS_FALLBACK=8.8.4.4
+
+FAIL_COUNT=0
+PRIMARY_IFACE=
+mkdir -p "$(dirname \"$LOG_FILE\")"
+touch "$LOG_FILE"
+chmod 0644 "$LOG_FILE" || true
+exec >>"$LOG_FILE" 2>&1
+
+timestamp() {
+  date '+%Y-%m-%d %H:%M:%S%z'
+}
+
+log() {
+  printf '[%s] %s\\n' "$(timestamp)" "$*"
+  if command -v logger >/dev/null 2>&1; then
+    logger -t vm-migrator-network-heal "$*" || true
+  fi
+}
+
+warn() {
+  log "WARN: $*"
+}
+"""
+
     return """#!/bin/sh
 set -u
 set -o pipefail
@@ -58,6 +98,23 @@ warn() {
   log "WARN: $*"
 }
 
+# --- AGGRESSIVE NETWORK CONFIG CLEANUP ---
+cleanup_cloud_init_net_configs() {
+  log "Removing old cloud-init and netplan network configs"
+  # Remove cloud-init generated network configs
+  rm -f /etc/cloud/cloud.cfg.d/*network* || true
+  rm -f /etc/cloud/cloud.cfg.d/subiquity* || true
+  rm -f /etc/cloud/cloud.cfg.d/50-curtin-networking.cfg || true
+  # Remove netplan configs
+  rm -f /etc/netplan/*.yaml || true
+  # Remove interfaces.d configs
+  rm -f /etc/network/interfaces.d/* || true
+  # Remove legacy ifupdown config
+  [ -f /etc/network/interfaces ] && mv /etc/network/interfaces /etc/network/interfaces.vmigrate.bak.$(date +%s) || true
+}
+
+# Call cleanup before any other network steps
+cleanup_cloud_init_net_configs
 error() {
   log "ERROR: $*"
 }

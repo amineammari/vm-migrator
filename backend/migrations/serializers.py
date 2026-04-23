@@ -101,6 +101,7 @@ class VMOverridesSerializer(serializers.Serializer):
     # Backward-compatible flag. When true, it maps to disk_layout_mode=concat.
     disk_merge = serializers.BooleanField(required=False, default=False)
     disk_layout_mode = serializers.CharField(required=False, allow_blank=True)
+    store_disks_locally = serializers.BooleanField(required=False, default=False)
 
     def validate(self, attrs):
         disk_layout_mode = str(attrs.get("disk_layout_mode", "") or "").strip().lower()
@@ -126,12 +127,14 @@ class VMOverridesSerializer(serializers.Serializer):
 class SelectedVMSerializer(serializers.Serializer):
     name = serializers.CharField(max_length=255)
     source = serializers.ChoiceField(choices=DiscoveredVM.Source.choices)
+    vmware_endpoint_session_id = serializers.IntegerField(min_value=1, required=False)
     overrides = VMOverridesSerializer(required=False)
 
 
 class CreateMigrationFromVMwareSerializer(serializers.Serializer):
-    vmware_endpoint_session_id = serializers.IntegerField(min_value=1)
-    openstack_endpoint_session_id = serializers.IntegerField(min_value=1)
+    vmware_endpoint_session_id = serializers.IntegerField(min_value=1, required=False)
+    openstack_endpoint_session_id = serializers.IntegerField(min_value=1, required=False)
+    openstack_project_name = serializers.CharField(max_length=255, required=False, allow_blank=True)
     vms = SelectedVMSerializer(many=True, allow_empty=False)
 
     def validate_vms(self, value):
@@ -139,21 +142,67 @@ class CreateMigrationFromVMwareSerializer(serializers.Serializer):
         user = getattr(request, "user", None)
         vmware_endpoint_session_id = self.initial_data.get("vmware_endpoint_session_id")
         openstack_endpoint_session_id = self.initial_data.get("openstack_endpoint_session_id")
+        openstack_project_name = str(self.initial_data.get("openstack_project_name", "") or "").strip()
+        all_store_locally = all(
+            isinstance(item.get("overrides"), dict)
+            and bool(item.get("overrides", {}).get("store_disks_locally", False))
+            for item in value
+        )
 
-        vmware_session = _session_for_user(VmwareEndpointSession, vmware_endpoint_session_id, user)
-        if vmware_session is None:
-            raise serializers.ValidationError("Invalid or unauthorized vmware_endpoint_session_id.")
-        openstack_session = _session_for_user(OpenstackEndpointSession, openstack_endpoint_session_id, user)
-        if openstack_session is None:
+        openstack_session = None
+        if openstack_endpoint_session_id:
+            openstack_session = _session_for_user(OpenstackEndpointSession, openstack_endpoint_session_id, user)
+        if openstack_session is None and not all_store_locally:
             raise serializers.ValidationError("Invalid or unauthorized openstack_endpoint_session_id.")
 
-        self.context["vmware_endpoint_session"] = vmware_session
         self.context["openstack_endpoint_session"] = openstack_session
+        self.context["openstack_project_name"] = (
+            openstack_project_name
+            or (openstack_session.project_name if openstack_session is not None else "")
+        )
 
-        keys = [(item["name"], item["source"]) for item in value]
+        vmware_session_by_id = {}
+        missing_session_refs = []
+        for item in value:
+            item_session_id = item.get("vmware_endpoint_session_id") or vmware_endpoint_session_id
+            try:
+                item_session_id = int(item_session_id)
+            except (TypeError, ValueError):
+                item_session_id = None
+            if not item_session_id:
+                missing_session_refs.append({"name": item.get("name"), "source": item.get("source")})
+                continue
+            if item_session_id not in vmware_session_by_id:
+                session = _session_for_user(VmwareEndpointSession, item_session_id, user)
+                if session is None:
+                    missing_session_refs.append(
+                        {
+                            "name": item.get("name"),
+                            "source": item.get("source"),
+                            "vmware_endpoint_session_id": item_session_id,
+                        }
+                    )
+                    continue
+                vmware_session_by_id[item_session_id] = session
+            item["vmware_endpoint_session_id"] = item_session_id
+
+        if missing_session_refs:
+            raise serializers.ValidationError(
+                f"Invalid or unauthorized vmware_endpoint_session_id for selections: {missing_session_refs}"
+            )
+
+        self.context["vmware_endpoint_sessions"] = vmware_session_by_id
+
+        keys = [
+            (item["name"], item["source"], item.get("vmware_endpoint_session_id"))
+            for item in value
+        ]
         duplicates = [k for k, count in Counter(keys).items() if count > 1]
         if duplicates:
-            duplicate_repr = [{"name": n, "source": s} for n, s in duplicates]
+            duplicate_repr = [
+                {"name": n, "source": s, "vmware_endpoint_session_id": endpoint_id}
+                for n, s, endpoint_id in duplicates
+            ]
             raise serializers.ValidationError(
                 f"Duplicate VM selections are not allowed: {duplicate_repr}"
             )
@@ -161,14 +210,21 @@ class CreateMigrationFromVMwareSerializer(serializers.Serializer):
         discovered_vm_map = {}
         missing = []
         for item in value:
-            key = (item["name"], item["source"])
+            item_session_id = item.get("vmware_endpoint_session_id")
+            key = (item["name"], item["source"], item_session_id)
             vm = DiscoveredVM.objects.filter(
                 name=item["name"],
                 source=item["source"],
-                vmware_endpoint_session_id=vmware_session.id,
+                vmware_endpoint_session_id=item_session_id,
             ).first()
             if vm is None:
-                missing.append({"name": item["name"], "source": item["source"]})
+                missing.append(
+                    {
+                        "name": item["name"],
+                        "source": item["source"],
+                        "vmware_endpoint_session_id": item_session_id,
+                    }
+                )
             else:
                 discovered_vm_map[key] = vm
 
@@ -194,6 +250,7 @@ class CreateMigrationFromVMwareSerializer(serializers.Serializer):
             floating_ip = override_payload.get("floating_ip")
             disk_layout_mode = override_payload.get("disk_layout_mode")
             disk_merge = override_payload.get("disk_merge")
+            store_disks_locally = override_payload.get("store_disks_locally")
             selected_disk_indexes = override_payload.get("selected_disk_indexes")
 
             if isinstance(flavor_id, str) and flavor_id.strip():
@@ -208,8 +265,10 @@ class CreateMigrationFromVMwareSerializer(serializers.Serializer):
                 cleaned["disk_layout_mode"] = disk_layout_mode.strip()
             if isinstance(disk_merge, bool) and disk_merge:
                 cleaned["disk_merge"] = True
+            if isinstance(store_disks_locally, bool) and store_disks_locally:
+                cleaned["store_disks_locally"] = True
             if isinstance(selected_disk_indexes, list):
-                vm = discovered_vm_map.get((item["name"], item["source"]))
+                vm = discovered_vm_map.get((item["name"], item["source"], item.get("vmware_endpoint_session_id")))
                 valid_indexes = sorted(
                     {
                         int(index)
@@ -305,9 +364,24 @@ class CreateMigrationFromVMwareSerializer(serializers.Serializer):
             for item in value
         )
 
-        if flavor_ids or network_ids or has_fixed_ip or floating_external_network_ids or floating_external_network_names or has_floating_ip:
+        needs_openstack_validation = (
+            flavor_ids
+            or network_ids
+            or has_fixed_ip
+            or floating_external_network_ids
+            or floating_external_network_names
+            or has_floating_ip
+        )
+        if needs_openstack_validation and openstack_session is None:
+            raise serializers.ValidationError("OpenStack endpoint is required when target flavors, networks, or floating IPs are selected.")
+
+        if needs_openstack_validation:
             try:
-                client = OpenStackClient(auth_config=openstack_session.to_connect_kwargs())
+                client = OpenStackClient(
+                    auth_config=openstack_session.to_connect_kwargs(
+                        project_name=self.context.get("openstack_project_name") or None
+                    )
+                )
                 available_flavors = {item.get("id") for item in client.list_flavors() if item.get("id")}
                 networks_payload = client.list_networks()
                 available_networks = {item.get("id") for item in networks_payload if item.get("id")}
@@ -436,11 +510,13 @@ class CreateMigrationFromVMwareSerializer(serializers.Serializer):
 
 class VmwareEndpointConnectSerializer(serializers.Serializer):
     label = serializers.CharField(max_length=255, required=False, allow_blank=True)
+    type = serializers.ChoiceField(choices=[("esxi", "ESXi"), ("vcenter", "vCenter")], default="esxi")
     host = serializers.CharField(max_length=255)
     port = serializers.IntegerField(required=False, min_value=1, max_value=65535, default=443)
     username = serializers.CharField(max_length=255)
     password = serializers.CharField(max_length=1024, trim_whitespace=False)
     insecure = serializers.BooleanField(required=False, default=True)
+    datacenter = serializers.CharField(max_length=255, required=False, allow_blank=True, default="")
 
 
 class OpenstackEndpointConnectSerializer(serializers.Serializer):
@@ -458,77 +534,6 @@ class OpenstackEndpointConnectSerializer(serializers.Serializer):
     image_endpoint_override = serializers.CharField(max_length=512, required=False, allow_blank=True, default="")
 
 
-class OpenstackNetworkCreateSerializer(serializers.Serializer):
-    openstack_endpoint_session_id = serializers.IntegerField(min_value=1, required=False)
-    name = serializers.CharField(max_length=255)
-    subnet_name = serializers.CharField(max_length=255, required=False, allow_blank=True, default="")
-    cidr = serializers.CharField(max_length=64)
-    gateway_ip = serializers.CharField(max_length=64, required=False, allow_blank=True, default="")
-    enable_dhcp = serializers.BooleanField(required=False, default=True)
-    allocation_pool_start = serializers.CharField(max_length=64, required=False, allow_blank=True, default="")
-    allocation_pool_end = serializers.CharField(max_length=64, required=False, allow_blank=True, default="")
-    dns_nameservers = serializers.ListField(
-        required=False,
-        allow_empty=True,
-        child=serializers.CharField(max_length=64),
-        default=list,
-    )
-
-    def validate(self, attrs):
-        try:
-            network = ip_network(str(attrs["cidr"]).strip(), strict=False)
-        except ValueError as exc:
-            raise serializers.ValidationError({"cidr": f"Invalid CIDR: {exc}"}) from exc
-
-        gateway_ip = str(attrs.get("gateway_ip", "") or "").strip()
-        if gateway_ip:
-            try:
-                gateway = ip_address(gateway_ip)
-            except ValueError as exc:
-                raise serializers.ValidationError({"gateway_ip": f"Invalid gateway IP: {exc}"}) from exc
-            if gateway not in network:
-                raise serializers.ValidationError({"gateway_ip": "Gateway IP must belong to the subnet CIDR."})
-            attrs["gateway_ip"] = gateway_ip
-        else:
-            attrs["gateway_ip"] = ""
-
-        pool_start = str(attrs.get("allocation_pool_start", "") or "").strip()
-        pool_end = str(attrs.get("allocation_pool_end", "") or "").strip()
-        if bool(pool_start) != bool(pool_end):
-            raise serializers.ValidationError(
-                {"allocation_pool_start": "Provide both allocation pool start and end, or leave both empty."}
-            )
-        if pool_start and pool_end:
-            try:
-                start_ip = ip_address(pool_start)
-                end_ip = ip_address(pool_end)
-            except ValueError as exc:
-                raise serializers.ValidationError({"allocation_pool_start": f"Invalid allocation pool IP: {exc}"}) from exc
-            if start_ip not in network or end_ip not in network:
-                raise serializers.ValidationError({"allocation_pool_start": "Allocation pool must stay inside the subnet CIDR."})
-            if start_ip > end_ip:
-                raise serializers.ValidationError({"allocation_pool_start": "Allocation pool start must be <= end."})
-            attrs["allocation_pool_start"] = pool_start
-            attrs["allocation_pool_end"] = pool_end
-        else:
-            attrs["allocation_pool_start"] = ""
-            attrs["allocation_pool_end"] = ""
-
-        dns_nameservers = []
-        for value in attrs.get("dns_nameservers", []):
-            dns_value = str(value or "").strip()
-            if not dns_value:
-                continue
-            try:
-                ip_address(dns_value)
-            except ValueError as exc:
-                raise serializers.ValidationError({"dns_nameservers": f"Invalid DNS nameserver '{dns_value}': {exc}"}) from exc
-            dns_nameservers.append(dns_value)
-        attrs["dns_nameservers"] = dns_nameservers
-        attrs["subnet_name"] = str(attrs.get("subnet_name", "") or "").strip()
-        attrs["name"] = str(attrs["name"]).strip()
-        attrs["cidr"] = str(attrs["cidr"]).strip()
-        return attrs
 
 
 class MigrationJobSummarySerializer(serializers.ModelSerializer):

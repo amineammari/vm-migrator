@@ -1,9 +1,14 @@
 import json
+import os
 from datetime import timedelta
 from pathlib import Path
 
 import dj_database_url
 import environ
+
+NFS_BASE_PATH = "/mnt/nfs"
+NFS_VMDK_PATH = os.path.join(NFS_BASE_PATH, "vmdk")
+NFS_QCOW2_PATH = os.path.join(NFS_BASE_PATH, "qcow2")
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -159,6 +164,7 @@ if ENABLE_PERIODIC_DISCOVERY:
 ENABLE_REAL_CONVERSION = env.bool("ENABLE_REAL_CONVERSION", default=False)
 MIGRATION_OUTPUT_DIR = env("MIGRATION_OUTPUT_DIR", default="/var/lib/vm-migrator/images")
 VIRT_V2V_TIMEOUT_SECONDS = env.int("VIRT_V2V_TIMEOUT_SECONDS", default=7200)
+VMDK_DOWNLOAD_TIMEOUT = env.int("VMDK_DOWNLOAD_TIMEOUT", default=7200)
 
 ENABLE_ROLLBACK = env.bool("ENABLE_ROLLBACK", default=True)
 

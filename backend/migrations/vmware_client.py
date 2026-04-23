@@ -1,3 +1,6 @@
+
+
+
 """Read-only VMware discovery clients for Workstation and ESXi/vCenter."""
 
 from __future__ import annotations
@@ -16,17 +19,31 @@ class VMwareClientError(Exception):
     """Raised when VMware discovery cannot complete."""
 
 
-class VMwareClient:
-    """Base interface for VMware discovery clients."""
+
+# Abstract provider interface for VMware sources
+class SourceProvider:
+    """Abstract base class for VMware source providers (ESXi, vCenter, etc.)."""
 
     source: str
 
-    def discover_vms(self) -> list[dict[str, Any]]:
+    def list_vms(self) -> list[dict[str, Any]]:
+        raise NotImplementedError
+
+    def get_vm_details(self, vm_id: str) -> dict[str, Any]:
+        raise NotImplementedError
+
+    def get_disks(self, vm_id: str) -> list[dict[str, Any]]:
+        raise NotImplementedError
+
+    def download_disk(self, disk: dict) -> str:
+        raise NotImplementedError
+
+    def get_networks(self, vm_id: str) -> list[dict[str, Any]]:
         raise NotImplementedError
 
 
 @dataclass
-class WorkstationVMwareClient(VMwareClient):
+class WorkstationVMwareClient(SourceProvider):
     """Discover local VMware Workstation/Fusion VMs from .vmx files."""
 
     scan_paths: list[str] | None = None
@@ -109,7 +126,7 @@ class WorkstationVMwareClient(VMwareClient):
 
 
 @dataclass
-class ESXiVMwareClient(VMwareClient):
+class ESXiProvider(SourceProvider):
     """Discover VMs from ESXi/vCenter using pyVmomi in read-only mode."""
 
     host: str
@@ -120,7 +137,7 @@ class ESXiVMwareClient(VMwareClient):
     source: str = "esxi"
 
     @classmethod
-    def from_env(cls) -> "ESXiVMwareClient":
+    def from_env(cls) -> "ESXiProvider":
         host = os.getenv("VMWARE_ESXI_HOST", "").strip()
         username = os.getenv("VMWARE_ESXI_USERNAME", "").strip()
         password = os.getenv("VMWARE_ESXI_PASSWORD", "").strip()
@@ -157,7 +174,7 @@ class ESXiVMwareClient(VMwareClient):
         total = 0
         for node in tree_nodes:
             total += 1
-            total += ESXiVMwareClient._snapshot_count(getattr(node, "childSnapshotList", None))
+            total += ESXiProvider._snapshot_count(getattr(node, "childSnapshotList", None))
         return total
 
     @staticmethod
@@ -233,9 +250,9 @@ class ESXiVMwareClient(VMwareClient):
 
             for device in getattr(config.hardware, "device", []):
                 if isinstance(device, vim.vm.device.VirtualDisk):
-                    disks.append(ESXiVMwareClient._disk_metadata(device))
+                    disks.append(ESXiProvider._disk_metadata(device))
                 elif isinstance(device, vim.vm.device.VirtualEthernetCard):
-                    nics.append(ESXiVMwareClient._nic_metadata(device))
+                    nics.append(ESXiProvider._nic_metadata(device))
 
         runtime = getattr(vm, "runtime", None)
         if runtime and getattr(runtime, "powerState", None) is not None:
@@ -277,7 +294,7 @@ class ESXiVMwareClient(VMwareClient):
         current_snapshot_name = None
         if snapshot_obj is not None:
             has_snapshots = True
-            snapshot_count = ESXiVMwareClient._snapshot_count(getattr(snapshot_obj, "rootSnapshotList", None))
+            snapshot_count = ESXiProvider._snapshot_count(getattr(snapshot_obj, "rootSnapshotList", None))
             current = getattr(snapshot_obj, "currentSnapshot", None)
             if current is not None and getattr(current, "name", None):
                 current_snapshot_name = str(current.name)
@@ -413,7 +430,12 @@ class ESXiVMwareClient(VMwareClient):
             },
         }
 
-    def discover_vms(self) -> list[dict[str, Any]]:
+
+    # SourceProvider interface implementation
+    def list_vms(self) -> list[dict[str, Any]]:
+        return self._discover_vms()
+
+    def _discover_vms(self) -> list[dict[str, Any]]:
         si = self._connect()
         try:
             content = si.RetrieveContent()
@@ -429,9 +451,115 @@ class ESXiVMwareClient(VMwareClient):
         except VMwareClientError:
             raise
         except Exception as exc:
-            raise VMwareClientError(f"Failed to discover VMs from ESXi/vCenter '{self.host}': {exc}") from exc
+            raise VMwareClientError(f"Failed to discover VMs from ESXi '{self.host}': {exc}") from exc
         finally:
             try:
                 Disconnect(si)
             except Exception:
                 pass
+
+    def get_vm_details(self, vm_id: str) -> dict[str, Any]:
+        vms = self.list_vms()
+        for vm in vms:
+            if vm.get("metadata", {}).get("moid") == vm_id or vm.get("name") == vm_id:
+                return vm
+        raise VMwareClientError(f"VM with id '{vm_id}' not found.")
+
+    def get_disks(self, vm_id: str) -> list[dict[str, Any]]:
+        vm = self.get_vm_details(vm_id)
+        return vm.get("disks", [])
+
+    def download_disk(self, disk: dict) -> str:
+        # Placeholder: implement disk download logic (e.g., via NFC/HTTPS) if needed
+        raise NotImplementedError("Disk download not implemented for ESXiProvider yet.")
+
+    def get_networks(self, vm_id: str) -> list[dict[str, Any]]:
+        vm = self.get_vm_details(vm_id)
+        return vm.get("metadata", {}).get("networks", [])
+
+
+@dataclass
+class VCenterProvider(SourceProvider):
+    """Provider for VMware vCenter using pyVmomi.
+
+    vCenter contains multiple ESXi hosts. VMs are discovered through the vCenter inventory
+    and serialized with host/cluster context.
+    """
+
+    host: str
+    username: str
+    password: str
+    port: int = 443
+    insecure: bool = True
+    datacenter: str | None = None
+    source: str = "vcenter"
+
+    def _connect(self):
+        try:
+            if self.insecure:
+                ctx = ssl._create_unverified_context()
+            else:
+                ctx = ssl.create_default_context()
+            return SmartConnect(
+                host=self.host,
+                user=self.username,
+                pwd=self.password,
+                port=self.port,
+                sslContext=ctx,
+            )
+        except Exception as exc:
+            raise VMwareClientError(f"Failed to connect to vCenter '{self.host}': {exc}") from exc
+
+    def list_vms(self) -> list[dict[str, Any]]:
+        si = self._connect()
+        try:
+            content = si.RetrieveContent()
+            root = content.rootFolder
+
+            if self.datacenter:
+                dc = next(
+                    (d for d in root.childEntity if getattr(d, "name", "") == self.datacenter),
+                    None,
+                )
+                if dc is None:
+                    raise VMwareClientError(f"Datacenter '{self.datacenter}' not found in vCenter '{self.host}'.")
+                container_view_root = dc.vmFolder
+            else:
+                container_view_root = root
+
+            container = content.viewManager.CreateContainerView(
+                container_view_root,
+                [vim.VirtualMachine],
+                True,
+            )
+            try:
+                return [ESXiProvider._serialize_vm(vm) for vm in container.view]
+            finally:
+                container.Destroy()
+        except VMwareClientError:
+            raise
+        except Exception as exc:
+            raise VMwareClientError(f"Failed to discover VMs from vCenter '{self.host}': {exc}") from exc
+        finally:
+            try:
+                Disconnect(si)
+            except Exception:
+                pass
+
+    def get_vm_details(self, vm_id: str) -> dict[str, Any]:
+        vms = self.list_vms()
+        for vm in vms:
+            if vm.get("metadata", {}).get("moid") == vm_id or vm.get("name") == vm_id:
+                return vm
+        raise VMwareClientError(f"VM with id '{vm_id}' not found in vCenter '{self.host}'.")
+
+    def get_disks(self, vm_id: str) -> list[dict[str, Any]]:
+        vm = self.get_vm_details(vm_id)
+        return vm.get("disks", [])
+
+    def download_disk(self, disk: dict) -> str:
+        raise NotImplementedError("Disk download not implemented for VCenterProvider yet.")
+
+    def get_networks(self, vm_id: str) -> list[dict[str, Any]]:
+        vm = self.get_vm_details(vm_id)
+        return vm.get("metadata", {}).get("networks", [])

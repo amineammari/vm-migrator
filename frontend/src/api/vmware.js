@@ -9,6 +9,11 @@ export async function fetchVMwareVMs({ endpointSessionId } = {}) {
   return data?.items || []
 }
 
+export async function fetchVMwareEndpointSessions() {
+  const data = await apiFetch('/api/vmware/endpoints')
+  return data?.items || []
+}
+
 export async function discoverVMwareNow({
   include_workstation = false,
   include_esxi = true,
@@ -28,10 +33,11 @@ export async function triggerMigrations({
   vms,
   vmware_endpoint_session_id,
   openstack_endpoint_session_id,
+  openstack_project_name,
 }) {
   return apiFetch('/api/migrations/from-vmware', {
     method: 'POST',
-    body: JSON.stringify({ vms, vmware_endpoint_session_id, openstack_endpoint_session_id }),
+    body: JSON.stringify({ vms, vmware_endpoint_session_id, openstack_endpoint_session_id, openstack_project_name }),
   })
 }
 

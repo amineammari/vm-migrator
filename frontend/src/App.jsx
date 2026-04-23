@@ -7,6 +7,7 @@ import { useAuth } from './contexts/useAuth'
 
 const DashboardPage = lazy(() => import('./pages/DashboardPage'))
 const DesignSystemPage = lazy(() => import('./pages/DesignSystemPage'))
+const InfraManagementPage = lazy(() => import('./pages/InfraManagementPage'))
 const JobDetailPage = lazy(() => import('./pages/JobDetailPage'))
 const LoginPage = lazy(() => import('./pages/LoginPage'))
 const LogsPage = lazy(() => import('./pages/LogsPage'))
@@ -32,6 +33,7 @@ function App() {
         >
           <Route index element={<Navigate to="/dashboard" replace />} />
           <Route path="dashboard" element={<DashboardPage />} />
+          <Route path="infrastructure" element={<InfraManagementPage />} />
           <Route path="migrations" element={<Navigate to="/inventory" replace />} />
           <Route path="logs" element={<LogsPage />} />
           <Route path="settings" element={<SettingsPage />} />

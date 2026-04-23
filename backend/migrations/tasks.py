@@ -67,7 +67,8 @@ from .openstack_deployment import (
 )
 from .terraform_runner import TerraformRunner, TerraformRunnerError
 from .snapshot_manager import SnapshotError, create_vm_snapshot
-from .vmware_client import ESXiVMwareClient, VMwareClientError, WorkstationVMwareClient
+from .vmware_client import ESXiProvider, VMwareClientError, WorkstationVMwareClient
+from core.services.nfs_storage import check_nfs_mounted, prepare_vm_dirs
 
 logger = logging.getLogger(__name__)
 
@@ -1136,7 +1137,10 @@ def _rollback_openstack_resources(job: MigrationJob, actions: list[dict[str, Any
                     }
                 )
                 return
-            auth_overrides = openstack_session.to_connect_kwargs()
+            selected_project_name = metadata.get("selected_openstack_project_name")
+            auth_overrides = openstack_session.to_connect_kwargs(
+                project_name=selected_project_name if isinstance(selected_project_name, str) and selected_project_name.strip() else None
+            )
         conn = connect_openstack(cloud=cloud, auth_overrides=auth_overrides)
     except OpenStackDeploymentError as exc:
         actions.append({"action": "openstack_cleanup", "status": "error", "error": str(exc)})
@@ -1374,6 +1378,7 @@ def _effective_target_spec(job: MigrationJob, discovered_vm: DiscoveredVM) -> di
     if isinstance(raw_extra_disks, list):
         extra_disks_gb = [int(v) for v in raw_extra_disks if isinstance(v, int) and v > 0]
     selected_disk_indexes = _resolve_selected_disk_indexes(discovered_vm, requested.get("selected_disk_indexes"))
+    store_disks_locally = bool(requested.get("store_disks_locally", False))
 
     return {
         "flavor_id": flavor_id,
@@ -1393,6 +1398,7 @@ def _effective_target_spec(job: MigrationJob, discovered_vm: DiscoveredVM) -> di
         "extra_disks_gb": extra_disks_gb,
         "selected_disk_indexes": selected_disk_indexes,
         "system_disk_index": selected_disk_indexes[0] if selected_disk_indexes else 0,
+        "store_disks_locally": store_disks_locally,
     }
 
 
@@ -1573,7 +1579,10 @@ def _run_openstack_deployment(job: MigrationJob, discovered_vm: DiscoveredVM) ->
         openstack_session = _openstack_session_for_job(job, selected_openstack_endpoint_session_id)
         if openstack_session is None:
             raise OpenStackDeploymentError("OpenStack session is missing or unauthorized for this job.")
-        auth_overrides = openstack_session.to_connect_kwargs()
+        selected_project_name = metadata.get("selected_openstack_project_name")
+        auth_overrides = openstack_session.to_connect_kwargs(
+            project_name=selected_project_name if isinstance(selected_project_name, str) and selected_project_name.strip() else None
+        )
     conn = connect_openstack(cloud=cloud, auth_overrides=auth_overrides)
 
     os_meta = metadata.get("openstack", {}) if isinstance(metadata.get("openstack"), dict) else {}
@@ -2025,17 +2034,78 @@ def start_migration(job_id: int) -> dict[str, Any]:
         metadata = job.conversion_metadata if isinstance(job.conversion_metadata, dict) else {}
         target_spec = _effective_target_spec(job, discovered_vm) if discovered_vm is not None else {}
 
+
         def _build_plan_with_context() -> tuple[ConversionPlan, dict[str, Any], Path | None]:
             esxi_uri = None
             passfile: Path | None = None
             validation: dict[str, Any] = {"checked_paths": [], "errors": [], "skipped": False}
             source_vm_for_plan = discovered_vm
+
+
+            # NFS workflow for ESXi
             if (
                 discovered_vm is not None
-                and discovered_vm.source == DiscoveredVM.Source.WORKSTATION
-                and isinstance(target_spec.get("selected_disk_indexes"), list)
+                and discovered_vm.source == DiscoveredVM.Source.ESXI
+                and target_spec.get("store_disks_locally")
             ):
-                source_vm_for_plan = _filter_source_disks(discovered_vm, target_spec["selected_disk_indexes"])
+                from copy import copy as shallow_copy
+                try:
+                    logger.info(f"[NFS] Checking NFS mount for job {job.id}")
+                    check_nfs_mounted()
+                    vmdk_path, qcow2_path = prepare_vm_dirs(str(job.id))
+                    validation["nfs_vmdk_path"] = vmdk_path
+                    validation["nfs_qcow2_path"] = qcow2_path
+
+                    # Download VMDK disks to NFS
+                    logger.info(f"[NFS] Downloading VMDK disks to {vmdk_path}")
+                    vmdk_result = download_vmdk_from_esxi(
+                        vm_name=discovered_vm.name,
+                        esxi_host=vmware_session.host,
+                        esxi_port=443,
+                        esxi_username=vmware_session.username,
+                        esxi_password=esxi_password,
+                        datastore_name=discovered_vm.datastore,
+                        vmdk_paths=[d["path"] for d in discovered_vm.disks if isinstance(d, dict) and "path" in d],
+                        job_id=job.id,
+                        insecure=bool(vmware_session.insecure),
+                    )
+                    if not vmdk_result.success:
+                        logger.error(f"[NFS] VMDK download failed: {vmdk_result.errors}")
+                        raise ConversionPlanningError(f"VMDK download failed: {vmdk_result.errors}")
+
+                    # Convert each VMDK to QCOW2 in NFS
+                    qcow2_files = []
+                    for vmdk_file in vmdk_result.paths:
+                        src_fmt = detect_disk_format(vmdk_file)
+                        qcow2_file = str(Path(qcow2_path) / (Path(vmdk_file).stem + ".qcow2"))
+                        logger.info(f"[NFS] Converting {vmdk_file} to {qcow2_file}")
+                        try:
+                            convert_with_qemu_img(
+                                source_path=vmdk_file,
+                                target_path=qcow2_file,
+                                source_format=src_fmt,
+                                target_format="qcow2",
+                            )
+                            qcow2_files.append(qcow2_file)
+                        except Exception as e:
+                            logger.error(f"[NFS] Conversion failed for {vmdk_file}: {e}")
+                            raise ConversionPlanningError(f"Conversion failed for {vmdk_file}: {e}")
+
+                    # Patch discovered_vm to use NFS QCOW2 paths
+                    patched_vm = shallow_copy(discovered_vm)
+                    patched_disks = []
+                    for i, disk in enumerate(discovered_vm.disks):
+                        if i < len(qcow2_files):
+                            d = dict(disk) if isinstance(disk, dict) else {}
+                            d["path"] = qcow2_files[i]
+                            patched_disks.append(d)
+                        else:
+                            patched_disks.append(disk)
+                    patched_vm.disks = patched_disks
+                    source_vm_for_plan = patched_vm
+                except Exception as e:
+                    logger.error(f"[NFS] Error in NFS workflow: {e}")
+                    raise ConversionPlanningError(f"NFS workflow failed: {e}")
 
             if discovered_vm.source == DiscoveredVM.Source.ESXI:
                 if (discovered_vm.power_state or "").lower() not in {"poweredoff", "powered_off", "poweroff", "off"}:
@@ -2454,6 +2524,27 @@ def start_migration(job_id: int) -> dict[str, Any]:
                 "deployment_enabled": False,
             }
 
+        if target_spec.get("store_disks_locally"):
+            metadata = job.conversion_metadata if isinstance(job.conversion_metadata, dict) else {}
+            conversion = metadata.get("conversion", {}) if isinstance(metadata.get("conversion"), dict) else {}
+            execution = conversion.get("execution", {}) if isinstance(conversion.get("execution"), dict) else {}
+            metadata["local_storage"] = {
+                "enabled": True,
+                "output_qcow2_path": execution.get("output_qcow2_path"),
+                "output_qcow2_paths": execution.get("output_qcow2_paths") if isinstance(execution.get("output_qcow2_paths"), list) else [],
+                "stored_at": timezone.now().isoformat(),
+                "note": "OpenStack deployment skipped by migration request.",
+            }
+            job.conversion_metadata = metadata
+            job.save(update_fields=["conversion_metadata", "updated_at"])
+            return {
+                "job_id": job.id,
+                "result": "stored_locally",
+                "status": job.status,
+                "deployment_enabled": False,
+                "local_storage": metadata["local_storage"],
+            }
+
         if job.status in {MigrationJob.Status.UPLOADING, MigrationJob.Status.DEPLOYED}:
             if not discovered_vm:
                 discovered_vm = _find_discovered_vm_for_job(job)
@@ -2605,7 +2696,7 @@ def discover_vmware_vms(
     if include_esxi:
         try:
             if vmware_session:
-                esxi_client = ESXiVMwareClient(
+                esxi_client = ESXiProvider(
                     host=vmware_session.host,
                     username=vmware_session.username,
                     password=vmware_session.password,
@@ -2613,8 +2704,8 @@ def discover_vmware_vms(
                     insecure=vmware_session.insecure,
                 )
             else:
-                esxi_client = ESXiVMwareClient.from_env()
-            esxi_items = esxi_client.discover_vms()
+                esxi_client = ESXiProvider.from_env()
+            esxi_items = esxi_client.list_vms()
             result["esxi"]["discovered"] = len(esxi_items)
             result["esxi"]["upserted"] = upsert_many(DiscoveredVM.Source.ESXI, esxi_items, vmware_session)
         except VMwareClientError as exc:

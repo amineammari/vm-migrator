@@ -881,7 +881,7 @@ class EndpointAccessTests(TestCase):
         self.assertEqual(response.data["network"]["id"], "net-1")
         self.assertEqual(len(response.data["items"]), 1)
 
-    @patch("migrations.views.ESXiVMwareClient")
+    @patch("migrations.views.ESXiProvider")
     def test_regular_user_can_test_vmware_endpoint(self, vmware_mock):
         vmware_mock.return_value.test_connection.return_value = {"ok": True, "message": "ok"}
 

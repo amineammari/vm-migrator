@@ -61,6 +61,125 @@ def _connect_kwargs_from_env() -> dict[str, Any] | None:
 
 
 class OpenStackClient:
+    # --- ROUTER MANAGEMENT (OpenStack Neutron) ---
+
+    def create_router(self, name: str, external_network_id: str) -> dict[str, Any]:
+            """
+            Create a Neutron router and set its external gateway.
+            Args:
+                name: Name of the router.
+                external_network_id: Network ID to use as external gateway.
+            Returns:
+                Router details as dict.
+            Raises:
+                OpenStackClientError on fatal error.
+            """
+            import logging
+            logger = logging.getLogger("migrations.openstack_client")
+            try:
+                existing = self._conn.network.find_router(name, ignore_missing=True)
+                if existing:
+                    logger.info(f"Router '{name}' already exists (id={existing.id})")
+                    return existing.to_dict()
+                router = self._conn.network.create_router(name=name)
+                logger.info(f"Created router '{name}' (id={router.id})")
+                # Set external gateway
+                router = self._conn.network.update_router(router, external_gateway_info={"network_id": external_network_id})
+                logger.info(f"Set external gateway for router '{name}' (id={router.id}) to network {external_network_id}")
+                return router.to_dict()
+            except (os_exceptions.SDKException, ks_exceptions.ClientException) as exc:
+                logger.error(f"Failed to create router '{name}': {exc}")
+                raise OpenStackClientError(f"Failed to create router: {exc}") from exc
+            except Exception as exc:
+                logger.error(f"Unexpected error during router creation: {exc}")
+                raise OpenStackClientError(f"Unexpected error during router creation: {exc}") from exc
+
+    def add_interface_to_router(self, router_id: str, subnet_id: str) -> dict[str, Any]:
+            """
+            Attach a subnet as an interface to a router.
+            Args:
+                router_id: Router ID.
+                subnet_id: Subnet ID to attach.
+            Returns:
+                Interface attachment result as dict.
+            """
+            import logging
+            logger = logging.getLogger("migrations.openstack_client")
+            try:
+                result = self._conn.network.add_interface_to_router(router_id, subnet_id=subnet_id)
+                logger.info(f"Attached subnet {subnet_id} to router {router_id}")
+                return result
+            except os_exceptions.ConflictException:
+                logger.warning(f"Subnet {subnet_id} is already attached to router {router_id}")
+                return {"status": "already-attached"}
+            except (os_exceptions.SDKException, ks_exceptions.ClientException) as exc:
+                logger.error(f"Failed to attach subnet {subnet_id} to router {router_id}: {exc}")
+                raise OpenStackClientError(f"Failed to attach subnet to router: {exc}") from exc
+            except Exception as exc:
+                logger.error(f"Unexpected error during interface attachment: {exc}")
+                raise OpenStackClientError(f"Unexpected error during interface attachment: {exc}") from exc
+
+    def remove_interface_from_router(self, router_id: str, subnet_id: str) -> dict[str, Any]:
+            """
+            Detach a subnet from a router.
+            Args:
+                router_id: Router ID.
+                subnet_id: Subnet ID to detach.
+            Returns:
+                Interface detachment result as dict.
+            """
+            import logging
+            logger = logging.getLogger("migrations.openstack_client")
+            try:
+                result = self._conn.network.remove_interface_from_router(router_id, subnet_id=subnet_id)
+                logger.info(f"Detached subnet {subnet_id} from router {router_id}")
+                return result
+            except os_exceptions.ConflictException:
+                logger.warning(f"Subnet {subnet_id} is not attached to router {router_id}")
+                return {"status": "not-attached"}
+            except (os_exceptions.SDKException, ks_exceptions.ClientException) as exc:
+                logger.error(f"Failed to detach subnet {subnet_id} from router {router_id}: {exc}")
+                raise OpenStackClientError(f"Failed to detach subnet from router: {exc}") from exc
+            except Exception as exc:
+                logger.error(f"Unexpected error during interface detachment: {exc}")
+                raise OpenStackClientError(f"Unexpected error during interface detachment: {exc}") from exc
+
+    def list_routers(self) -> list[dict[str, Any]]:
+            """
+            List all routers visible to the current project.
+            Returns:
+                List of routers as dicts.
+            """
+            import logging
+            logger = logging.getLogger("migrations.openstack_client")
+            try:
+                routers = [router.to_dict() for router in self._conn.network.routers()]
+                logger.info(f"Listed {len(routers)} routers")
+                return routers
+            except (os_exceptions.SDKException, ks_exceptions.ClientException) as exc:
+                logger.error(f"Failed to list routers: {exc}")
+                raise OpenStackClientError(f"Failed to list routers: {exc}") from exc
+            except Exception as exc:
+                logger.error(f"Unexpected error while listing routers: {exc}")
+                raise OpenStackClientError(f"Unexpected error while listing routers: {exc}") from exc
+
+    def delete_router(self, router_id: str) -> None:
+            """
+            Delete a router by ID.
+            Args:
+                router_id: Router ID to delete.
+            """
+            import logging
+            logger = logging.getLogger("migrations.openstack_client")
+            try:
+                self._conn.network.delete_router(router_id, ignore_missing=True)
+                logger.info(f"Deleted router {router_id}")
+            except (os_exceptions.SDKException, ks_exceptions.ClientException) as exc:
+                logger.error(f"Failed to delete router {router_id}: {exc}")
+                raise OpenStackClientError(f"Failed to delete router: {exc}") from exc
+            except Exception as exc:
+                logger.error(f"Unexpected error during router deletion: {exc}")
+                raise OpenStackClientError(f"Unexpected error during router deletion: {exc}") from exc
     """Small abstraction around openstacksdk using cloud='openstack'."""
 
     def __init__(self, cloud: str = "openstack", auth_config: dict[str, Any] | None = None) -> None:
@@ -134,6 +253,33 @@ class OpenStackClient:
             raise OpenStackClientError(f"Failed to list OpenStack flavors: {exc}") from exc
         except Exception as exc:
             raise OpenStackClientError(f"Unexpected error while listing OpenStack flavors: {exc}") from exc
+
+    def list_projects(self) -> list[dict[str, Any]]:
+        """List projects visible to the authenticated user."""
+        try:
+            current_project_id = getattr(self._conn, "current_project_id", None)
+            items: list[dict[str, Any]] = []
+            for project in self._conn.identity.projects():
+                project_id = getattr(project, "id", None)
+                project_name = getattr(project, "name", None)
+                if not project_id and not project_name:
+                    continue
+                items.append(
+                    {
+                        "id": project_id,
+                        "name": project_name,
+                        "domain_id": getattr(project, "domain_id", None),
+                        "description": getattr(project, "description", None),
+                        "is_enabled": getattr(project, "is_enabled", None),
+                        "is_current": bool(project_id and current_project_id and str(project_id) == str(current_project_id)),
+                    }
+                )
+            items.sort(key=lambda item: (str(item.get("name") or ""), str(item.get("id") or "")))
+            return items
+        except (os_exceptions.SDKException, ks_exceptions.ClientException) as exc:
+            raise OpenStackClientError(f"Failed to list OpenStack projects: {exc}") from exc
+        except Exception as exc:
+            raise OpenStackClientError(f"Unexpected error while listing OpenStack projects: {exc}") from exc
 
     def list_networks(self) -> list[dict[str, Any]]:
         """List available tenant/provider networks (basic fields)."""

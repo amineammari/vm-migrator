@@ -1,19 +1,19 @@
 import { Fragment, useEffect, useMemo, useState } from 'react'
 import {
-  closeVMwareEndpointSession,
   connectVMwareEndpoint,
   discoverVMwareNow,
-  fetchVMwareEndpointSession,
+  fetchVMwareEndpointSessions,
   fetchTaskStatus,
   fetchVMwareVMs,
   testVMwareEndpoint,
   triggerMigrations,
 } from '../api/vmware'
 import {
-  closeOpenstackEndpointSession,
   connectOpenstackEndpoint,
   fetchOpenStackNetworkCatalog,
   fetchOpenStackFlavors,
+  fetchOpenstackEndpointProjects,
+  fetchOpenstackEndpointSessions,
   fetchOpenstackEndpointSession,
   testOpenstackEndpoint,
 } from '../api/openstack'
@@ -35,7 +35,13 @@ function VMwareInventoryPage() {
   const [externalNetworks, setExternalNetworks] = useState([])
   const [availableFloatingIps, setAvailableFloatingIps] = useState([])
 
-  const [activeVmwareEndpoint, setActiveVmwareEndpoint] = useState(null)
+  const [vmwareEndpoints, setVmwareEndpoints] = useState([])
+  const [openstackEndpoints, setOpenstackEndpoints] = useState([])
+  const [selectedVmwareEndpointIds, setSelectedVmwareEndpointIds] = useState([])
+  const [selectedOpenstackEndpointId, setSelectedOpenstackEndpointId] = useState('')
+  const [openstackProjects, setOpenstackProjects] = useState([])
+  const [selectedOpenstackProject, setSelectedOpenstackProject] = useState('')
+
   const [activeOpenstackEndpoint, setActiveOpenstackEndpoint] = useState(null)
 
   const [showVmwareModal, setShowVmwareModal] = useState(false)
@@ -48,12 +54,15 @@ function VMwareInventoryPage() {
 
   const [vmwareForm, setVmwareForm] = useState({
     label: '',
+    type: 'esxi',
     host: '',
     port: 443,
     username: '',
     password: '',
     insecure: true,
+    datacenter: '',
   })
+  const vmwareFormTitle = vmwareForm.type === 'vcenter' ? 'Connect VMware vCenter' : 'Connect VMware ESXi'
   const [vmwareTesting, setVmwareTesting] = useState(false)
   const [vmwareConnecting, setVmwareConnecting] = useState(false)
   const [vmwareTestPassed, setVmwareTestPassed] = useState(false)
@@ -118,39 +127,52 @@ function VMwareInventoryPage() {
     let mounted = true
 
     async function restoreSessions() {
-      const storedVmwareId = Number(localStorage.getItem('active_vmware_endpoint_session_id')) || null
+      const storedVmwareIds = parseStoredIds(localStorage.getItem('active_vmware_endpoint_session_ids'))
+      const legacyVmwareId = Number(localStorage.getItem('active_vmware_endpoint_session_id')) || null
+      const initialVmwareIds = storedVmwareIds.length ? storedVmwareIds : legacyVmwareId ? [legacyVmwareId] : []
       const storedOpenstackId = Number(localStorage.getItem('active_openstack_endpoint_session_id')) || null
+      const storedProject = localStorage.getItem('active_openstack_project_name') || ''
 
-      if (storedVmwareId) {
-        try {
-          const session = await fetchVMwareEndpointSession(storedVmwareId)
-          if (!mounted) return
-          setActiveVmwareEndpoint(session)
-          await loadVMs(storedVmwareId)
-        } catch {
-          if (!mounted) return
-          localStorage.removeItem('active_vmware_endpoint_session_id')
-          setActiveVmwareEndpoint(null)
-        }
+      const [vmwareItems, openstackItems] = await Promise.all([
+        fetchVMwareEndpointSessions(),
+        fetchOpenstackEndpointSessions(),
+      ])
+      if (!mounted) return
+      setVmwareEndpoints(vmwareItems)
+      setOpenstackEndpoints(openstackItems)
+
+      const allowedVmwareIds = new Set(vmwareItems.map((item) => Number(item.id)))
+      const nextVmwareIds = initialVmwareIds.filter((id) => allowedVmwareIds.has(Number(id)))
+      setSelectedVmwareEndpointIds(nextVmwareIds)
+      if (nextVmwareIds.length) {
+        await loadVMs(nextVmwareIds)
       }
 
       if (storedOpenstackId) {
         try {
-          const session = await fetchOpenstackEndpointSession(storedOpenstackId)
+          const session = openstackItems.find((item) => Number(item.id) === Number(storedOpenstackId))
+            || await fetchOpenstackEndpointSession(storedOpenstackId)
           if (!mounted) return
           setActiveOpenstackEndpoint(session)
+          setSelectedOpenstackEndpointId(String(storedOpenstackId))
+          const projects = await fetchOpenstackEndpointProjects(storedOpenstackId)
+          if (!mounted) return
+          setOpenstackProjects(projects)
+          const nextProject = storedProject || session?.project_name || projects[0]?.name || ''
+          setSelectedOpenstackProject(nextProject)
           const [flavorsData, networksData] = await Promise.all([
-            fetchOpenStackFlavors(storedOpenstackId),
-            fetchOpenStackNetworkCatalog(storedOpenstackId),
+            fetchOpenStackFlavors(storedOpenstackId, { projectName: nextProject }),
+            fetchOpenStackNetworkCatalog(storedOpenstackId, { projectName: nextProject }),
           ])
           if (!mounted) return
-          setFlavors(flavorsData)
+          setFlavors(Array.isArray(flavorsData) ? flavorsData : [])
           setNetworks(networksData?.items || [])
           setExternalNetworks(networksData?.external_networks || [])
           setAvailableFloatingIps(networksData?.available_floating_ips || [])
         } catch {
           if (!mounted) return
           localStorage.removeItem('active_openstack_endpoint_session_id')
+          localStorage.removeItem('active_openstack_project_name')
           setActiveOpenstackEndpoint(null)
         }
       }
@@ -160,15 +182,32 @@ function VMwareInventoryPage() {
     return () => {
       mounted = false
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  async function loadVMs(endpointSessionId) {
-    if (typeof endpointSessionId !== 'number') return
+  async function loadVMs(endpointSessionIds) {
+    const ids = Array.isArray(endpointSessionIds) ? endpointSessionIds : [endpointSessionIds]
+    const cleanIds = ids.map((id) => Number(id)).filter((id) => Number.isInteger(id) && id > 0)
+    if (!cleanIds.length) {
+      setVMs([])
+      return
+    }
     setLoading(true)
     setError('')
     try {
-      const items = await fetchVMwareVMs({ endpointSessionId })
-      setVMs(items)
+      const endpointById = new Map(vmwareEndpoints.map((item) => [Number(item.id), item]))
+      const batches = await Promise.all(
+        cleanIds.map(async (endpointSessionId) => {
+          const items = await fetchVMwareVMs({ endpointSessionId })
+          const endpoint = endpointById.get(Number(endpointSessionId))
+          return items.map((item) => ({
+            ...item,
+            vmware_endpoint_session_id: item.vmware_endpoint_session_id || endpointSessionId,
+            vmware_endpoint_label: endpointLabel(endpoint) || `ESXi #${endpointSessionId}`,
+          }))
+        }),
+      )
+      setVMs(batches.flat())
     } catch (err) {
       setError(err.message || 'Unable to load VMware inventory.')
     } finally {
@@ -176,39 +215,128 @@ function VMwareInventoryPage() {
     }
   }
 
+  async function handleVmwareSelectionChange(event) {
+    const ids = Array.from(event.target.selectedOptions)
+      .map((option) => Number(option.value))
+      .filter((id) => Number.isInteger(id) && id > 0)
+    setSelectedVmwareEndpointIds(ids)
+    localStorage.setItem('active_vmware_endpoint_session_ids', JSON.stringify(ids))
+    if (ids[0]) {
+      localStorage.setItem('active_vmware_endpoint_session_id', String(ids[0]))
+    } else {
+      localStorage.removeItem('active_vmware_endpoint_session_id')
+    }
+    setSelectedKeys(new Set())
+    setSpecByKey({})
+    setExpandedVmKey('')
+    await loadVMs(ids)
+  }
+
+  async function handleOpenstackSelectionChange(event) {
+    const endpointId = event.target.value
+    setSelectedOpenstackEndpointId(endpointId)
+    setOpenstackProjects([])
+    setSelectedOpenstackProject('')
+    setFlavors([])
+    setNetworks([])
+    setExternalNetworks([])
+    setAvailableFloatingIps([])
+    setActiveOpenstackEndpoint(null)
+    if (!endpointId) {
+      localStorage.removeItem('active_openstack_endpoint_session_id')
+      localStorage.removeItem('active_openstack_project_name')
+      return
+    }
+
+    const endpoint = openstackEndpoints.find((item) => String(item.id) === String(endpointId)) || null
+    setActiveOpenstackEndpoint(endpoint)
+    localStorage.setItem('active_openstack_endpoint_session_id', String(endpointId))
+    setOpenstackError('')
+    try {
+      const projects = await fetchOpenstackEndpointProjects(endpointId)
+      setOpenstackProjects(projects)
+      const nextProject = endpoint?.project_name || projects[0]?.name || ''
+      setSelectedOpenstackProject(nextProject)
+      localStorage.setItem('active_openstack_project_name', nextProject)
+      await loadOpenstackCatalog(endpointId, nextProject)
+    } catch (err) {
+      setOpenstackError(err.message || 'Impossible de charger les projets OpenStack.')
+    }
+  }
+
+  async function handleProjectSelectionChange(event) {
+    const projectName = event.target.value
+    setSelectedOpenstackProject(projectName)
+    localStorage.setItem('active_openstack_project_name', projectName)
+    if (selectedOpenstackEndpointId) {
+      await loadOpenstackCatalog(selectedOpenstackEndpointId, projectName)
+    }
+  }
+
+  async function loadOpenstackCatalog(endpointId, projectName) {
+    if (!endpointId) return
+    setOpenstackError('')
+    const [flavorsData, networkCatalog] = await Promise.all([
+      fetchOpenStackFlavors(Number(endpointId), { projectName }),
+      fetchOpenStackNetworkCatalog(Number(endpointId), { projectName }),
+    ])
+    setFlavors(Array.isArray(flavorsData) ? flavorsData : [])
+    setNetworks(networkCatalog?.items || [])
+    setExternalNetworks(networkCatalog?.external_networks || [])
+    setAvailableFloatingIps(networkCatalog?.available_floating_ips || [])
+    setSpecByKey((current) => {
+      const next = {}
+      for (const [key, spec] of Object.entries(current)) {
+        next[key] = {
+          ...spec,
+          flavor_id: '',
+          network_id: '',
+          fixed_ip: '',
+          floating_ip_external_network_id: '',
+          floating_ip_address: '',
+        }
+      }
+      return next
+    })
+  }
+
   async function refreshFromESXi() {
-    if (!activeVmwareEndpoint?.id) {
-      setError('Connectez-vous d\'abord a un endpoint VMware ESXi.')
+    if (!selectedVmwareEndpointIds.length) {
+      setError('Choisissez au moins un endpoint VMware.')
       return
     }
     setRefreshing(true)
     setError('')
     try {
-      const discovery = await discoverVMwareNow({
-        include_workstation: false,
-        include_esxi: true,
-        vmware_endpoint_session_id: activeVmwareEndpoint.id,
-      })
-      const taskId = discovery?.task_id
-      if (!taskId) throw new Error('Discovery did not return a task id.')
+      for (const endpointId of selectedVmwareEndpointIds) {
+        const endpoint = vmwareEndpoints.find((e) => Number(e.id) === Number(endpointId))
+        const isVcenter = endpoint?.datacenter !== undefined
+        const discovery = await discoverVMwareNow({
+          include_workstation: false,
+          include_esxi: !isVcenter,
+          vmware_endpoint_session_id: endpointId,
+        })
+        const taskId = discovery?.task_id
+        if (!taskId) throw new Error('Discovery did not return a task id.')
 
-      const final = await waitForTaskCompletion(taskId)
-      if (final?.state !== 'SUCCESS') {
-        const reason =
-          typeof final?.result === 'string'
-            ? final.result
-            : final?.result?.error || `Discovery task failed with state ${final?.state}.`
-        throw new Error(reason)
+        const final = await waitForTaskCompletion(taskId)
+        if (final?.state !== 'SUCCESS') {
+          const reason =
+            typeof final?.result === 'string'
+              ? final.result
+              : final?.result?.error || `Discovery task failed with state ${final?.state}.`
+          throw new Error(reason)
+        }
+
+        const esxiErrors = final?.result?.esxi?.errors
+        if (Array.isArray(esxiErrors) && esxiErrors.length > 0) {
+          throw new Error(esxiErrors[0])
+        }
       }
 
-      const esxiErrors = final?.result?.esxi?.errors
-      if (Array.isArray(esxiErrors) && esxiErrors.length > 0) {
-        throw new Error(esxiErrors[0])
-      }
-
-      await loadVMs(activeVmwareEndpoint.id)
+      await loadVMs(selectedVmwareEndpointIds)
     } catch (err) {
-      setError(err.message || 'Unable to refresh ESXi inventory.')
+      setError(err.message || 'Unable to refresh VMware inventory.')
     } finally {
       setRefreshing(false)
     }
@@ -265,11 +393,15 @@ function VMwareInventoryPage() {
 
   async function migrateSelected() {
     if (!selectedVMs.length) return
-    if (!activeVmwareEndpoint?.id) {
-      setError('Veuillez connecter un endpoint VMware ESXi.')
+    if (!selectedVmwareEndpointIds.length) {
+      setError('Veuillez choisir un endpoint VMware ESXi.')
       return
     }
-    if (!activeOpenstackEndpoint?.id) {
+    const allLocalOnly = selectedVMs.every((vm) => {
+      const spec = specByKey[makeKey(vm)] || buildDefaultSpec(vm)
+      return spec.store_disks_locally === true
+    })
+    if (!activeOpenstackEndpoint?.id && !allLocalOnly) {
       setOpenstackError('Veuillez connecter un endpoint OpenStack.')
       return
     }
@@ -284,14 +416,19 @@ function VMwareInventoryPage() {
         const key = makeKey(vm)
         const spec = specByKey[key] || buildDefaultSpec(vm)
         const overrides = buildOverrides(spec)
-        const base = { name: vm.name, source: vm.source }
+        const base = {
+          name: vm.name,
+          source: vm.source,
+          vmware_endpoint_session_id: vm.vmware_endpoint_session_id,
+        }
         if (Object.keys(overrides).length) base.overrides = overrides
         return base
       })
       const response = await triggerMigrations({
         vms: payload,
-        vmware_endpoint_session_id: activeVmwareEndpoint.id,
-        openstack_endpoint_session_id: activeOpenstackEndpoint.id,
+        vmware_endpoint_session_id: selectedVmwareEndpointIds.length === 1 ? selectedVmwareEndpointIds[0] : undefined,
+        openstack_endpoint_session_id: activeOpenstackEndpoint?.id,
+        openstack_project_name: selectedOpenstackProject,
       })
       setResult(response)
       setSelectedKeys(new Set())
@@ -307,13 +444,16 @@ function VMwareInventoryPage() {
     setVmwareTesting(true)
     setVmwareTestPassed(false)
     setVmwareTestMessage('')
+    setError('')
     try {
-      const res = await testVMwareEndpoint(vmwareForm)
+      const payload = { ...vmwareForm }
+      if (payload.type !== 'vcenter') delete payload.datacenter
+      const res = await testVMwareEndpoint(payload)
       setVmwareTestPassed(Boolean(res?.ok))
-      setVmwareTestMessage(res?.message || 'Test reussi.')
+      setVmwareTestMessage(res?.message || 'Test réussi.')
     } catch (err) {
       setVmwareTestPassed(false)
-      setVmwareTestMessage(err.message || 'Echec du test VMware ESXi.')
+      setVmwareTestMessage(err.message || 'Echec du test VMware.')
     } finally {
       setVmwareTesting(false)
     }
@@ -322,18 +462,33 @@ function VMwareInventoryPage() {
   async function handleVmwareConnect() {
     setVmwareConnecting(true)
     setError('')
+    setVmwareTestPassed(false)
+    setVmwareTestMessage('')
     try {
-      const res = await connectVMwareEndpoint(vmwareForm)
-      setActiveVmwareEndpoint(res?.vmware_endpoint_session || null)
+      const payload = { ...vmwareForm }
+      if (payload.type !== 'vcenter') delete payload.datacenter
+      const res = await connectVMwareEndpoint(payload)
       const endpointId = res?.vmware_endpoint_session?.id
       if (endpointId) {
         localStorage.setItem('active_vmware_endpoint_session_id', String(endpointId))
+        localStorage.setItem('active_vmware_endpoint_session_ids', JSON.stringify([endpointId]))
+        setSelectedVmwareEndpointIds([endpointId])
       }
       setVMs(Array.isArray(res?.items) ? res.items : [])
       setSelectedKeys(new Set())
       setSpecByKey({})
       setExpandedVmKey('')
       setShowVmwareModal(false)
+      setVmwareForm({
+        label: '',
+        type: 'esxi',
+        host: '',
+        port: 443,
+        username: '',
+        password: '',
+        insecure: true,
+        datacenter: '',
+      })
       setVmwareTestPassed(false)
       setVmwareTestMessage('')
     } catch (err) {
@@ -343,27 +498,11 @@ function VMwareInventoryPage() {
     }
   }
 
-  async function handleVmwareDisconnect() {
-    if (!activeVmwareEndpoint?.id) return
-    setError('')
-    try {
-      await closeVMwareEndpointSession(activeVmwareEndpoint.id)
-    } catch (err) {
-      setError(err.message || 'Impossible de fermer la session VMware.')
-    } finally {
-      localStorage.removeItem('active_vmware_endpoint_session_id')
-      setActiveVmwareEndpoint(null)
-      setVMs([])
-      setSelectedKeys(new Set())
-      setSpecByKey({})
-      setExpandedVmKey('')
-    }
-  }
-
   async function handleOpenstackTest() {
     setOpenstackTesting(true)
     setOpenstackTestPassed(false)
     setOpenstackTestMessage('')
+    setOpenstackError('')
     try {
       const res = await testOpenstackEndpoint(openstackForm)
       setOpenstackTestPassed(Boolean(res?.ok))
@@ -379,6 +518,8 @@ function VMwareInventoryPage() {
   async function handleOpenstackConnect() {
     setOpenstackConnecting(true)
     setOpenstackError('')
+    setOpenstackTestPassed(false)
+    setOpenstackTestMessage('')
     try {
       const res = await connectOpenstackEndpoint(openstackForm)
       setActiveOpenstackEndpoint(res?.openstack_endpoint_session || null)
@@ -386,14 +527,11 @@ function VMwareInventoryPage() {
       if (endpointId) {
         localStorage.setItem('active_openstack_endpoint_session_id', String(endpointId))
       }
-      const [flavorsData, networkCatalog] = await Promise.all([
-        fetchOpenStackFlavors(endpointId),
-        fetchOpenStackNetworkCatalog(endpointId),
-      ])
-      setFlavors(flavorsData)
-      setNetworks(networkCatalog?.items || [])
-      setExternalNetworks(networkCatalog?.external_networks || [])
-      setAvailableFloatingIps(networkCatalog?.available_floating_ips || [])
+      setSelectedOpenstackEndpointId(String(endpointId || ''))
+      setSelectedOpenstackProject(res?.openstack_endpoint_session?.project_name || '')
+      if (endpointId) {
+        await loadOpenstackCatalog(endpointId, res?.openstack_endpoint_session?.project_name || '')
+      }
       setShowOpenstackModal(false)
       setOpenstackTestPassed(false)
       setOpenstackTestMessage('')
@@ -407,23 +545,6 @@ function VMwareInventoryPage() {
     }
   }
 
-  async function handleOpenstackDisconnect() {
-    if (!activeOpenstackEndpoint?.id) return
-    setOpenstackError('')
-    try {
-      await closeOpenstackEndpointSession(activeOpenstackEndpoint.id)
-    } catch (err) {
-      setOpenstackError(err.message || 'Impossible de fermer la session OpenStack.')
-    } finally {
-      localStorage.removeItem('active_openstack_endpoint_session_id')
-      setActiveOpenstackEndpoint(null)
-      setFlavors([])
-      setNetworks([])
-      setExternalNetworks([])
-      setAvailableFloatingIps([])
-    }
-  }
-
   return (
     <section>
       <PageHeader
@@ -434,37 +555,17 @@ function VMwareInventoryPage() {
             Select discovered VMs and start migration jobs.
           <div className="endpoint-summary">
             <span>
-              VMware: {activeVmwareEndpoint ? `${activeVmwareEndpoint.host}:${activeVmwareEndpoint.port}` : 'Non connecte'}
+              VMware: {selectedVmwareEndpointIds.length ? `${selectedVmwareEndpointIds.length} source(s) selectionnee(s)` : 'Non selectionne'}
             </span>
             <span>
-              OpenStack: {activeOpenstackEndpoint ? `${activeOpenstackEndpoint.project_name} @ ${activeOpenstackEndpoint.auth_url}` : 'Non connecte'}
+              OpenStack: {activeOpenstackEndpoint ? `${endpointLabel(activeOpenstackEndpoint)} / ${selectedOpenstackProject || activeOpenstackEndpoint.project_name}` : 'Non selectionne'}
             </span>
           </div>
           </>
         }
         actions={
           <>
-          <Button variant="secondary" onClick={() => setShowVmwareModal(true)} disabled={submitting}>
-            Connect ESXi
-          </Button>
-          <Button
-            variant="secondary"
-            onClick={handleVmwareDisconnect}
-            disabled={submitting || !activeVmwareEndpoint}
-          >
-            Disconnect ESXi
-          </Button>
-          <Button variant="secondary" onClick={() => setShowOpenstackModal(true)} disabled={submitting}>
-            Connect OpenStack
-          </Button>
-          <Button
-            variant="secondary"
-            onClick={handleOpenstackDisconnect}
-            disabled={submitting || !activeOpenstackEndpoint}
-          >
-            Disconnect OpenStack
-          </Button>
-          <Button variant="secondary" onClick={refreshFromESXi} disabled={loading || refreshing || submitting || !activeVmwareEndpoint}>
+          <Button variant="secondary" onClick={refreshFromESXi} disabled={loading || refreshing || submitting || !selectedVmwareEndpointIds.length}>
             {refreshing ? 'Refreshing...' : 'Refresh'}
           </Button>
           </>
@@ -479,9 +580,80 @@ function VMwareInventoryPage() {
         </Alert>
       )}
 
+
+      <div className="inventory-targets-grid">
+        <Card className="inventory-vmware-card">
+          <label style={{ display: 'block' }}>
+            <span>VMware source</span>
+            <select
+              multiple
+              value={selectedVmwareEndpointIds.map(String)}
+              onChange={handleVmwareSelectionChange}
+              disabled={submitting}
+              style={{ width: '100%' }}
+            >
+              {vmwareEndpoints.map((endpoint) => (
+                <option key={endpoint.id} value={endpoint.id}>
+                  {endpointLabel(endpoint)}
+                </option>
+              ))}
+            </select>
+            <small>Selection multiple possible pour migrer des VMs de plusieurs ESXi.</small>
+          </label>
+        </Card>
+        <Card className="inventory-openstack-card">
+          <div
+            style={{
+              display: 'grid',
+              gridTemplateColumns: '1fr 1fr',
+              gap: '2rem',
+              alignItems: 'start',
+            }}
+          >
+            <div>
+              <label style={{ display: 'block' }}>
+                <span>OpenStack cible</span>
+                <select
+                  value={selectedOpenstackEndpointId}
+                  onChange={handleOpenstackSelectionChange}
+                  disabled={submitting}
+                  style={{ width: '100%' }}
+                >
+                  <option value="">Choisir OpenStack</option>
+                  {openstackEndpoints.map((endpoint) => (
+                    <option key={endpoint.id} value={endpoint.id}>
+                      {endpointLabel(endpoint)}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
+            <div>
+              <label style={{ display: 'block' }}>
+                <span>Projet OpenStack</span>
+                <select
+                  value={selectedOpenstackProject}
+                  onChange={handleProjectSelectionChange}
+                  disabled={submitting || !selectedOpenstackEndpointId}
+                  style={{ width: '100%' }}
+                >
+                  <option value="">Choisir projet</option>
+                  {openstackProjects.map((project) => (
+                    <option key={project.id || project.name} value={project.name}>
+                      {project.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <small>Networks et flavors sont recharges pour ce projet.</small>
+            </div>
+          </div>
+        </Card>
+      </div>
+
       <Card>
-        {!activeVmwareEndpoint ? (
-          <PanelState title="No ESXi connection" message="Open Connect ESXi and test credentials before loading inventory." />
+        {!selectedVmwareEndpointIds.length ? (
+          <PanelState title="No VMware source selected" message="Choisissez un ou plusieurs endpoints VMware." />
         ) : loading ? (
           <PanelState title="Loading inventory" message="Fetching discovered VMware VMs..." />
         ) : vms.length === 0 ? (
@@ -492,7 +664,7 @@ function VMwareInventoryPage() {
               <p>{selectedVMs.length} selected</p>
               <Button
                 onClick={migrateSelected}
-                disabled={!selectedVMs.length || submitting || !activeOpenstackEndpoint}
+                disabled={!selectedVMs.length || submitting}
               >
                 {submitting ? 'Submitting...' : 'Migrate selected VMs'}
               </Button>
@@ -693,6 +865,14 @@ function VMwareInventoryPage() {
                             placeholder="20, 50"
                           />
                         </label>
+                        <label className="checkbox-line span-2">
+                          <input
+                            type="checkbox"
+                            checked={Boolean(spec.store_disks_locally)}
+                            onChange={(e) => updateSpec(vm, 'store_disks_locally', e.target.checked)}
+                          />
+                          <span>Stocker les disques convertis localement sans deploiement OpenStack</span>
+                        </label>
                         <div className="span-2">
                           <span>Disks to migrate</span>
                           <div className="subtable">
@@ -794,7 +974,7 @@ function VMwareInventoryPage() {
                             <span>{metadata?.vmx_datastore_path || metadata?.instance_uuid || '-'}</span>
                           </div>
                         </td>
-                        <td><Badge tone="info">{vm.source}</Badge></td>
+                        <td><Badge tone="info">{vm.vmware_endpoint_label || vm.source}</Badge></td>
                         <td>{guestOs}</td>
                         <td>{ip}</td>
                         <td>{vm.cpu ?? '-'}</td>
@@ -831,7 +1011,7 @@ function VMwareInventoryPage() {
       {showVmwareModal && (
         <div className="modal-backdrop" onClick={() => setShowVmwareModal(false)}>
           <div className="modal-card" onClick={(e) => e.stopPropagation()}>
-            <h3>Connect VMware ESXi</h3>
+            <h3>{vmwareFormTitle}</h3>
             <div className="modal-grid">
               <label>
                 <span>Label</span>
@@ -855,42 +1035,20 @@ function VMwareInventoryPage() {
                 <span>Username</span>
                 <input value={vmwareForm.username} onChange={(e) => setVmwareForm((v) => ({ ...v, username: e.target.value }))} />
               </label>
-              <label className="span-2">
-                <span>Password</span>
-                <input type="password" value={vmwareForm.password} onChange={(e) => setVmwareForm((v) => ({ ...v, password: e.target.value }))} />
+<label className="span-2">
+                <span>Label</span>
+                <input value={vmwareForm.label} onChange={(e) => setVmwareForm((v) => ({ ...v, label: e.target.value }))} />
               </label>
-              <label className="checkbox-line span-2">
-                <input
-                  type="checkbox"
-                  checked={vmwareForm.insecure}
-                  onChange={(e) => setVmwareForm((v) => ({ ...v, insecure: e.target.checked }))}
-                />
-                <span>Disable SSL verification (insecure)</span>
+              <label>
+                <span>Source Type</span>
+                <select
+                  value={vmwareForm.type}
+                  onChange={(e) => setVmwareForm((v) => ({ ...v, type: e.target.value }))}
+                >
+                  <option value="esxi">ESXi</option>
+                  <option value="vcenter">vCenter</option>
+                </select>
               </label>
-            </div>
-            {vmwareTestMessage && (
-              <Alert tone={vmwareTestPassed ? 'success' : 'error'}>{vmwareTestMessage}</Alert>
-            )}
-            <div className="modal-actions">
-              <Button variant="secondary" onClick={handleVmwareTest} disabled={vmwareTesting || vmwareConnecting}>
-                {vmwareTesting ? 'Testing...' : 'Test'}
-              </Button>
-              <Button
-                onClick={handleVmwareConnect}
-                disabled={!vmwareTestPassed || vmwareTesting || vmwareConnecting}
-              >
-                {vmwareConnecting ? 'Connecting...' : 'Connect'}
-              </Button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {showOpenstackModal && (
-        <div className="modal-backdrop" onClick={() => setShowOpenstackModal(false)}>
-          <div className="modal-card" onClick={(e) => e.stopPropagation()}>
-            <h3>Connect OpenStack</h3>
-            <div className="modal-grid">
               <label>
                 <span>Label</span>
                 <input value={openstackForm.label} onChange={(e) => setOpenstackForm((v) => ({ ...v, label: e.target.value }))} />
@@ -969,7 +1127,25 @@ function VMwareInventoryPage() {
 }
 
 function makeKey(vm) {
-  return `${vm.source}::${vm.name}`
+  return `${vm.vmware_endpoint_session_id || 'none'}::${vm.source}::${vm.name}`
+}
+
+function parseStoredIds(value) {
+  try {
+    const parsed = JSON.parse(value || '[]')
+    if (!Array.isArray(parsed)) return []
+    return parsed.map((item) => Number(item)).filter((item) => Number.isInteger(item) && item > 0)
+  } catch {
+    return []
+  }
+}
+
+function endpointLabel(endpoint) {
+  if (!endpoint) return ''
+  if (endpoint.label) return endpoint.label
+  if (endpoint.host) return `${endpoint.host}:${endpoint.port || 443}`
+  if (endpoint.project_name) return `${endpoint.project_name} @ ${endpoint.auth_url}`
+  return endpoint.auth_url || `Endpoint #${endpoint.id}`
 }
 
 function buildDefaultSpec(vm) {
@@ -991,6 +1167,7 @@ function buildDefaultSpec(vm) {
     extra_disks_gb: '',
     selected_disk_indexes: allDiskIndexes,
     system_disk_index: systemDiskIndex,
+    store_disks_locally: false,
   }
 }
 
@@ -1014,6 +1191,9 @@ function buildOverrides(spec) {
       .map((value) => Number.parseInt(String(value), 10))
       .filter((value) => Number.isInteger(value) && value >= 0)
       .sort((a, b) => a - b)
+  }
+  if (spec?.store_disks_locally === true) {
+    overrides.store_disks_locally = true
   }
 
   const network = {}

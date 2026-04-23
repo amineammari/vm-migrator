@@ -90,6 +90,7 @@ class DiscoveredVM(models.Model):
     class Source(models.TextChoices):
         WORKSTATION = "workstation", "Workstation"
         ESXI = "esxi", "ESXi"
+        VCENTER = "vcenter", "vCenter"
 
     name = models.CharField(max_length=255)
     vmware_endpoint_session = models.ForeignKey(
@@ -161,6 +162,8 @@ class VmwareEndpointSession(models.Model):
     username = models.CharField(max_length=255)
     password = encrypt(models.CharField(max_length=1024))
     insecure = models.BooleanField(default=True)
+    # vCenter-specific
+    datacenter = models.CharField(max_length=255, blank=True, default="")
     last_test_status = models.CharField(max_length=16, choices=TestStatus.choices, default=TestStatus.UNKNOWN)
     last_test_message = models.TextField(blank=True, default="")
     last_test_at = models.DateTimeField(null=True, blank=True)
@@ -214,12 +217,12 @@ class OpenstackEndpointSession(models.Model):
         region = self.region_name or "-"
         return self.label or f"{self.username}@{self.project_name} ({region})"
 
-    def to_connect_kwargs(self) -> dict[str, object]:
+    def to_connect_kwargs(self, *, project_name: str | None = None) -> dict[str, object]:
         kwargs: dict[str, object] = {
             "auth_url": self.auth_url,
             "username": self.username,
             "password": self.password,
-            "project_name": self.project_name,
+            "project_name": project_name or self.project_name,
             "user_domain_name": self.user_domain_name,
             "project_domain_name": self.project_domain_name,
             "verify": bool(self.verify),

@@ -1,5 +1,10 @@
 import { useEffect, useState } from 'react'
 import { createOpenStackNetwork, fetchOpenStackNetworkCatalog } from '../api/openstack'
+import {
+  fetchOpenStackRouters,
+  createOpenStackRouter,
+  attachSubnetToRouter,
+} from '../api/openstack'
 import PanelState from '../components/PanelState'
 import { Alert, Badge, Button, Card, Field, PageHeader, Table, Toggle } from '../components/ui'
 
@@ -38,6 +43,15 @@ function SettingsPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [openstackEndpointSessionId])
 
+  // Remove duplicate declarations of tableTotalPages and pagedNetworks
+
+  // (Suppression des redéfinitions, une seule version de chaque fonction et état doit rester)
+
+  useEffect(() => {
+    loadRouters()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [openstackEndpointSessionId])
+
   useEffect(() => {
     setTablePage(1)
   }, [networks.length])
@@ -55,9 +69,9 @@ function SettingsPage() {
     setLoading(true)
     try {
       const data = await fetchOpenStackNetworkCatalog(openstackEndpointSessionId)
-      setNetworks(data.items)
-      setExternalNetworks(data.external_networks)
-      setFloatingIps(data.available_floating_ips)
+      setNetworks(data?.items || [])
+      setExternalNetworks(data?.external_networks || [])
+      setFloatingIps(data?.available_floating_ips || [])
       setError('')
     } catch (err) {
       setError(err.message || 'Unable to load network settings.')
@@ -108,6 +122,52 @@ function SettingsPage() {
       setNetworkCreateBusy(false)
     }
   }
+
+  async function loadRouters() {
+    if (!openstackEndpointSessionId) return
+    setRouters(await fetchOpenStackRouters(openstackEndpointSessionId))
+  }
+
+  async function handleCreateRouter(e) {
+    e.preventDefault()
+    setRouterCreateMsg('')
+    try {
+      await createOpenStackRouter({
+        openstack_endpoint_session_id: openstackEndpointSessionId,
+        name: routerForm.name,
+        external_network_id: routerForm.external_network_id,
+      })
+      setRouterCreateMsg('Router created!')
+      setRouterForm({ name: '', external_network_id: '' })
+      loadRouters()
+    } catch (err) {
+      setRouterCreateMsg(err.message || 'Router creation failed')
+    }
+  }
+
+  async function handleAttachSubnet(e) {
+    e.preventDefault()
+    setRouterAttachMsg('')
+    try {
+      await attachSubnetToRouter({
+        openstack_endpoint_session_id: openstackEndpointSessionId,
+        router_id: routerAttachForm.router_id,
+        subnet_id: routerAttachForm.subnet_id,
+      })
+      setRouterAttachMsg('Subnet attached!')
+      setRouterAttachForm({ router_id: '', subnet_id: '' })
+      loadRouters()
+    } catch (err) {
+      setRouterAttachMsg(err.message || 'Attach failed')
+    }
+  }
+
+  // --- Router management state ---
+  const [routers, setRouters] = useState([])
+  const [routerForm, setRouterForm] = useState({ name: '', external_network_id: '' })
+  const [routerCreateMsg, setRouterCreateMsg] = useState('')
+  const [routerAttachMsg, setRouterAttachMsg] = useState('')
+  const [routerAttachForm, setRouterAttachForm] = useState({ router_id: '', subnet_id: '' })
 
   return (
     <section>
@@ -280,6 +340,51 @@ function SettingsPage() {
                 </tbody>
             </Table>
           )}
+        </Card>
+
+        <Card className="span-12">
+          <h3>OpenStack Routers</h3>
+          <Button onClick={loadRouters}>Refresh Routers</Button>
+          <ul>
+            {routers.map(r => (
+              <li key={r.id}>{r.name} ({r.id})</li>
+            ))}
+          </ul>
+          <form onSubmit={handleCreateRouter} style={{ marginTop: 16 }}>
+            <Field label="Router name">
+              <input value={routerForm.name} onChange={e => setRouterForm(f => ({ ...f, name: e.target.value }))} required />
+            </Field>
+            <Field label="External network">
+              <select value={routerForm.external_network_id} onChange={e => setRouterForm(f => ({ ...f, external_network_id: e.target.value }))} required>
+                <option value="">Select external network</option>
+                {externalNetworks.map(n => (
+                  <option key={n.id} value={n.id}>{n.name || n.id}</option>
+                ))}
+              </select>
+            </Field>
+            <Button type="submit">Create Router</Button>
+            {routerCreateMsg && <Alert>{routerCreateMsg}</Alert>}
+          </form>
+          <form onSubmit={handleAttachSubnet} style={{ marginTop: 16 }}>
+            <Field label="Router">
+              <select value={routerAttachForm.router_id} onChange={e => setRouterAttachForm(f => ({ ...f, router_id: e.target.value }))} required>
+                <option value="">Select router</option>
+                {routers.map(r => (
+                  <option key={r.id} value={r.id}>{r.name || r.id}</option>
+                ))}
+              </select>
+            </Field>
+            <Field label="Subnet">
+              <select value={routerAttachForm.subnet_id} onChange={e => setRouterAttachForm(f => ({ ...f, subnet_id: e.target.value }))} required>
+                <option value="">Select subnet</option>
+                {networks.flatMap(n => (n.subnets || [])).map(s => (
+                  <option key={s.id} value={s.id}>{s.name || s.cidr}</option>
+                ))}
+              </select>
+            </Field>
+            <Button type="submit">Attach Subnet</Button>
+            {routerAttachMsg && <Alert>{routerAttachMsg}</Alert>}
+          </form>
         </Card>
       </div>
 

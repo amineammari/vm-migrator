@@ -98,7 +98,7 @@ function DashboardPage() {
             </div>
           </div>
           <div className="chart-placeholder" role="img" aria-label="Migration throughput chart placeholder">
-            {[42, 58, 36, 72, 66, 84, 61].map((height, index) => (
+            {(dashboard?.throughput || [42, 58, 36, 72, 66, 84, 61]).map((height, index) => (
               <span key={index} style={{ '--bar-height': `${height}%` }} />
             ))}
           </div>
@@ -111,9 +111,30 @@ function DashboardPage() {
               <p>Completion ratio in current scope</p>
             </div>
           </div>
-          <div className="donut-meter" style={{ '--meter': `${healthPercent * 3.6}deg` }}>
-            <strong>{healthPercent}%</strong>
-            <span>verified</span>
+          <div
+            className="donut-meter"
+            style={
+              healthPercent > 0
+                ? { '--meter': `${healthPercent * 3.6}deg` }
+                : { '--meter': '0deg', background: 'conic-gradient(var(--color-neutral-300) 360deg, var(--color-neutral-100) 0)' }
+            }
+          >
+            <div style={{
+              position: 'absolute',
+              top: 0,
+              left: 0,
+              width: '100%',
+              height: '100%',
+              display: 'flex',
+              flexDirection: 'column',
+              alignItems: 'center',
+              justifyContent: 'center',
+              zIndex: 2,
+              pointerEvents: 'none',
+            }}>
+              <strong>{healthPercent}%</strong>
+              <span>verified</span>
+            </div>
           </div>
         </Card>
       </div>
